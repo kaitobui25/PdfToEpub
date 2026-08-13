@@ -1,4 +1,4 @@
-from pdf_to_epub.deep.gate import apply_ai_ops
+from pdf_to_epub.deep.gate import apply_ai_ops, apply_ai_sentence
 from pdf_to_epub.models import DeepQueueItem
 
 
@@ -89,3 +89,109 @@ def test_unrelated_segmentation_is_rejected() -> None:
     )
     assert corrected == source.current
     assert audit[0]["gate"] == "segmentation_without_visual_or_shape_support"
+
+
+def test_sentence_repairs_bat_dau_as_one_atomic_phrase() -> None:
+    source = item(
+        "Xác định thời gian bất đâu cho công việc.",
+        ["Xác định thời gian bắt đâu cho công việc."],
+    )
+    corrected, audit = apply_ai_sentence(
+        source,
+        {
+            "corrected_sentence": "Xác định thời gian bắt đầu cho công việc.",
+            "confidence": 0.99,
+        },
+        0.97,
+    )
+    assert corrected == "Xác định thời gian bắt đầu cho công việc."
+    assert len(audit) == 1
+    assert audit[0]["old"] == "bất đâu"
+    assert audit[0]["new"] == "bắt đầu"
+    assert audit[0]["applied"] is True
+
+
+def test_sentence_repairs_cam_cui_together() -> None:
+    source = item(
+        "Lạc Da đang cam cui làm việc.",
+        ["Lạc Đà đang cặm cui làm việc."],
+    )
+    corrected, audit = apply_ai_sentence(
+        source,
+        {
+            "corrected_sentence": "Lạc Đà đang cặm cụi làm việc.",
+            "confidence": 0.99,
+        },
+        0.97,
+    )
+    assert corrected == "Lạc Đà đang cặm cụi làm việc."
+    assert len(audit) == 2
+    assert all(change["applied"] for change in audit)
+
+
+def test_sentence_context_can_fix_lau_dai_shape_preserving_phrase() -> None:
+    source = item(
+        "Về lau đài, những ranh giới này sẽ bảo vệ bạn.",
+        ["Về lâu đài, những ranh giới này sẽ bảo vệ bạn."],
+    )
+    corrected, audit = apply_ai_sentence(
+        source,
+        {
+            "corrected_sentence": "Về lâu dài, những ranh giới này sẽ bảo vệ bạn.",
+            "confidence": 0.99,
+        },
+        0.97,
+    )
+    assert corrected == "Về lâu dài, những ranh giới này sẽ bảo vệ bạn."
+    assert audit[0]["old"] == "lau đài"
+    assert audit[0]["new"] == "lâu dài"
+    assert audit[0]["gate"] == "sentence_shape_preserving"
+
+
+def test_sentence_uses_full_candidate_to_choose_do_rac_nao_bo() -> None:
+    source = item(
+        "Hãy tạo một danh sách “dé rác não bổ”.",
+        ["Hãy tạo một danh sách “đổ rác não bộ”."],
+    )
+    corrected, audit = apply_ai_sentence(
+        source,
+        {
+            "corrected_sentence": "Hãy tạo một danh sách “đổ rác não bộ”.",
+            "confidence": 0.95,
+        },
+        0.97,
+    )
+    assert corrected == "Hãy tạo một danh sách “đổ rác não bộ”."
+    assert all(change["applied"] for change in audit)
+
+
+def test_sentence_rewrite_without_evidence_is_rejected() -> None:
+    source = item("Đây là một câu bình thường.", [])
+    corrected, audit = apply_ai_sentence(
+        source,
+        {
+            "corrected_sentence": "Đây là một câu hoàn hảo.",
+            "confidence": 0.99,
+        },
+        0.97,
+    )
+    assert corrected == source.current
+    assert audit[0]["gate"] == "unsupported_sentence_span"
+
+
+def test_sentence_is_all_or_none_when_one_span_fails() -> None:
+    source = item(
+        "Xác định thời gian bất đâu và một việc xấu.",
+        ["Xác định thời gian bắt đâu và một việc xấu."],
+    )
+    corrected, audit = apply_ai_sentence(
+        source,
+        {
+            "corrected_sentence": "Xác định thời gian bắt đầu và một việc tốt.",
+            "confidence": 0.99,
+        },
+        0.97,
+    )
+    assert corrected == source.current
+    assert any(change["gate"] == "unsupported_sentence_span" for change in audit)
+    assert not any(change["applied"] for change in audit)
