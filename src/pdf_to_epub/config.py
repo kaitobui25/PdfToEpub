@@ -10,6 +10,7 @@ from pathlib import Path
 DEFAULT_MODEL = "opencode/deepseek-v4-flash-free"
 DEEP_TRUST_LEVELS = ("strict", "balanced", "high")
 ON_OFF_CHOICES = ("on", "off")
+PATCH_PROJECTION_MODES = ("on", "off", "smart")
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +40,7 @@ class DeepConfig:
     min_apply_confidence: float = 0.97
     deep_trust: str = "high"
     ocr_evidence_gate: bool = True
-    patch_projection: bool = True
+    patch_projection: str = "on"
     call_timeout_seconds: int = 120
     max_ops_per_item: int = 3
 
