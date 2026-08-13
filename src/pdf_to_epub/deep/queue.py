@@ -12,6 +12,7 @@ from typing import Any, Iterable
 from ..jsonio import read_json
 from ..models import DeepQueueItem
 from .candidates import build_book_stats, build_choice_sets
+from .policy import finalize_choice_policy
 
 MARKER_RE = re.compile(r"^===== PDF(\d{3})-([LR]) =====$")
 LEXICAL_RE = re.compile(r"[0-9A-Za-zÀ-ỹĐđ]+", re.UNICODE)
@@ -208,8 +209,9 @@ def build_queue(
             candidate_meta=metadata,
         )
         item.choice_sets = build_choice_sets(item, stats)
-        # No local candidate means there is nothing safe for Deep to invent.
-        # KEEP locally instead of paying for an unconstrained generation call.
+        # Policy may add a safe lost-boundary choice even when the base
+        # candidate generator had no spelling alternative (e.g. Chọn3).
+        finalize_choice_policy(item, stats)
         if not item.choice_sets:
             skipped += 1
             continue
