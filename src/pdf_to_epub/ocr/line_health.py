@@ -116,6 +116,11 @@ def analyze_line_health(
             "line_symbol_soup" in reason_set
             and bool(reason_set & {"line_fragmented_words", "line_lexicon_collapse", "line_cross_pass_instability"})
         )
+        or {
+            "line_fragmented_words",
+            "line_lexicon_collapse",
+            "line_low_candidate_confidence",
+        }.issubset(reason_set)
         or (
             {"line_fragmented_words", "line_cross_pass_instability"}.issubset(reason_set)
             and bool(reason_set & {"line_lexicon_collapse", "line_low_candidate_confidence"})
