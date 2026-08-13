@@ -1,74 +1,20 @@
-"""Evidence-aware safety gate for DeepSeek OCR corrections.
+"""Evidence-aware OCR gate for constrained Deep choices.
 
-DeepSeek proposes edits; this module decides whether independent OCR evidence is
-strong enough to apply them. Confidence is therefore not a global on/off switch:
-a lower-confidence suggestion can pass when OCR alternatives agree, while an
-unsupported rewrite remains blocked even at high confidence.
+New runs use locally generated KEEP/C1/C2/... choices.  Deep may select a choice
+but cannot invent replacement text.  Strong local candidates are applied after
+one closed-choice vote; medium candidates require a second binary verifier vote.
+The older free-form operation path is retained only for backwards-compatible
+unit tests and old serialized experiments.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-import re
 from typing import Any
 
 from ..models import DeepQueueItem
-from ..ocr.scoring import diacritic_only, normalize_token, shape_key
-
-
-@dataclass(frozen=True, slots=True)
-class EvidenceProfile:
-    old_votes: int
-    new_votes: int
-    candidate_count: int
-    shape_preserving: bool
-    segmented: bool
-
-    def as_dict(self) -> dict[str, object]:
-        return asdict(self)
-
-
-def _normalized_words(text: str) -> list[str]:
-    return [normalize_token(part) for part in text.split() if normalize_token(part)]
-
-
-def _candidate_contains_sequence(candidate: str, value: str) -> bool:
-    """Match one token or a short segmented phrase inside an OCR alternative."""
-
-    candidate_words = _normalized_words(candidate)
-    wanted = _normalized_words(value)
-    if not wanted or len(wanted) > len(candidate_words):
-        return False
-    width = len(wanted)
-    return any(candidate_words[index : index + width] == wanted for index in range(len(candidate_words) - width + 1))
-
-
-def _evidence(item: DeepQueueItem, old: str, new: str) -> EvidenceProfile:
-    old_votes = sum(1 for candidate in item.candidates if _candidate_contains_sequence(candidate, old))
-    new_votes = sum(1 for candidate in item.candidates if _candidate_contains_sequence(candidate, new))
-    segmented = len(new.split()) > 1
-    return EvidenceProfile(
-        old_votes=old_votes,
-        new_votes=new_votes,
-        candidate_count=len(item.candidates),
-        shape_preserving=bool(shape_key(old)) and shape_key(old) == shape_key(new),
-        segmented=segmented,
-    )
-
-
-def _token_matches(text: str, token: str) -> list[re.Match[str]]:
-    """Find exact OCR-token occurrences without matching inside another word."""
-
-    pattern = re.compile(rf"(?<!\w){re.escape(token)}(?!\w)", re.UNICODE)
-    return list(pattern.finditer(text))
-
-
-def _replace_unique_token(text: str, old: str, new: str) -> tuple[str, int]:
-    matches = _token_matches(text, old)
-    if len(matches) != 1:
-        return text, len(matches)
-    match = matches[0]
-    return text[: match.start()] + new + text[match.end() :], 1
+from ..ocr.scoring import normalize_token, strip_diacritics
+from .evidence import EvidenceProfile, summarize_evidence
+from .tokens import TokenRef, index_tokens
 
 
 def _operation_kind(raw: dict[str, Any], new: str) -> str:
@@ -79,53 +25,268 @@ def _operation_kind(raw: dict[str, Any], new: str) -> str:
 
 
 def _valid_segment(old: str, new: str) -> bool:
-    """Allow one fused OCR token to become two/three real words, never a rewrite."""
-
     if any(char.isspace() for char in old):
         return False
     parts = new.split()
     return 2 <= len(parts) <= 3 and all(normalize_token(part) for part in parts)
 
 
-def _required_confidence(base: float, evidence: EvidenceProfile) -> float | None:
-    """Convert independent visual support into a dynamic confidence threshold.
+def _has_diacritic(text: str) -> bool:
+    return strip_diacritics(text) != text
 
-    With the default base=0.97:
-      - 2+ OCR alternatives supporting NEW: threshold 0.92
-      - 1 OCR alternative supporting NEW: threshold 0.95
-      - shape-preserving candidate support (diacritics/segmentation): up to 0.02 lower
-      - no visual NEW support: only shape-preserving edits at >=0.98
-    """
 
-    if evidence.new_votes >= 2:
-        threshold = max(0.90, base - 0.05)
-        if evidence.shape_preserving:
-            threshold = max(0.90, threshold - 0.02)
-        return threshold
-    if evidence.new_votes == 1:
-        threshold = max(0.92, base - 0.02)
-        if evidence.shape_preserving:
-            threshold = max(0.90, threshold - 0.02)
-        return threshold
+def _edit_distance_at_most_one(left: str, right: str) -> bool:
+    left = normalize_token(left)
+    right = normalize_token(right)
+    if left == right:
+        return True
+    if abs(len(left) - len(right)) > 1:
+        return False
+    if len(left) == len(right):
+        return sum(a != b for a, b in zip(left, right)) <= 1
+    if len(left) > len(right):
+        left, right = right, left
+    i = j = mismatches = 0
+    while i < len(left) and j < len(right):
+        if left[i] == right[j]:
+            i += 1
+            j += 1
+        else:
+            mismatches += 1
+            j += 1
+            if mismatches > 1:
+                return False
+    return True
+
+
+def _resolve_token(text: str, old: str, token_id: str | None) -> tuple[TokenRef | None, str | None]:
+    tokens = index_tokens(text)
+    if token_id:
+        token = next((candidate for candidate in tokens if candidate.token_id == token_id), None)
+        if token is None:
+            return None, "unknown_token_id"
+        if token.text != old:
+            return None, "token_id_old_mismatch"
+        return token, None
+
+    matches = [token for token in tokens if token.text == old]
+    if len(matches) != 1:
+        return None, "old_not_unique_token_in_current"
+    return matches[0], None
+
+
+def _legacy_required_confidence(evidence: EvidenceProfile) -> float | None:
+    if evidence.new_score >= 2.0:
+        return 0.92
+    if evidence.new_score >= 1.0:
+        return 0.95
     if evidence.shape_preserving:
-        return max(base, 0.98)
+        return 0.98
     return None
+
+
+def _legacy_decision(
+    kind: str,
+    old: str,
+    new: str,
+    confidence: float,
+    evidence: EvidenceProfile,
+) -> tuple[str, str, float | None]:
+    if evidence.legacy:
+        required = _legacy_required_confidence(evidence)
+        if kind == "segment":
+            if evidence.new_score >= 1.0 and confidence >= 0.95:
+                return "auto", "segmentation_evidence", 0.95
+            if evidence.shape_preserving and confidence >= 0.98:
+                return "auto", "segmentation_shape", 0.98
+            if not (evidence.new_score or evidence.shape_preserving):
+                return "reject", "segmentation_without_visual_or_shape_support", required
+            return "verify", "needs_verifier_segmentation", required
+
+        if required is None:
+            return "reject", "unsupported_new", None
+        if confidence >= required:
+            return "auto", "ocr_evidence" if evidence.new_score else "shape_preserving", required
+        return "verify", "needs_verifier_legacy", required
+
+    if kind == "segment":
+        if evidence.new_score >= 0.75 and confidence >= 0.85:
+            return "auto", "segmentation_evidence", 0.85
+        if evidence.shape_preserving and evidence.old_non_dictionary and _has_diacritic(new) and confidence >= 0.90:
+            return "auto", "segmentation_shape", 0.90
+        if evidence.shape_preserving and confidence >= 0.97:
+            return "auto", "segmentation_shape", 0.97
+        if evidence.new_score or evidence.shape_preserving:
+            return "verify", "needs_verifier_segmentation", None
+        return "reject", "segmentation_without_visual_or_shape_support", None
+
+    if evidence.new_score >= 1.60 and confidence >= 0.88:
+        return "auto", "ocr_evidence", 0.88
+    if evidence.shape_preserving and evidence.new_score >= 0.55 and confidence >= 0.90:
+        return "auto", "ocr_evidence", 0.90
+    if evidence.old_non_dictionary and evidence.new_score >= 0.80 and confidence >= 0.88:
+        return "auto", "ocr_evidence", 0.88
+    if evidence.shape_preserving and evidence.new_score == 0 and confidence >= 0.98:
+        return "auto", "shape_preserving", 0.98
+    if evidence.shape_preserving and confidence >= 0.75:
+        return "verify", "needs_verifier_shape", None
+    if evidence.old_non_dictionary and _edit_distance_at_most_one(old, new) and confidence >= 0.80:
+        return "verify", "needs_verifier_lexical", None
+    if evidence.new_score > 0 and confidence >= 0.75:
+        return "verify", "needs_verifier_visual", None
+    return "reject", "unsupported_new", None
+
+
+def _choice_set(item: DeepQueueItem, token_id: str) -> dict[str, Any] | None:
+    return next((row for row in item.choice_sets if str(row.get("token_id")) == token_id), None)
+
+
+def _choice(row: dict[str, Any], choice_id: str) -> dict[str, Any] | None:
+    return next((choice for choice in row.get("choices", []) if str(choice.get("choice_id")) == choice_id), None)
+
+
+def render_applied_ops(item: DeepQueueItem, audited: list[dict[str, Any]]) -> str:
+    """Render all approved edits against original stable token spans."""
+
+    tokens = {token.token_id: token for token in index_tokens(item.current)}
+    edits: list[tuple[int, int, str]] = []
+    used: set[str] = set()
+    for record in audited:
+        if not record.get("applied"):
+            continue
+        token_id = str(record.get("token_id") or "")
+        if not token_id or token_id in used:
+            continue
+        token = tokens.get(token_id)
+        if token is None:
+            continue
+        new = str(record.get("new") or "")
+        if not new:
+            continue
+        used.add(token_id)
+        edits.append((token.start, token.end, new))
+
+    current = item.current
+    for start, end, new in sorted(edits, key=lambda value: value[0], reverse=True):
+        current = current[:start] + new + current[end:]
+    return current
+
+
+def apply_verifier_votes(
+    item: DeepQueueItem,
+    audited: list[dict[str, Any]],
+    votes: dict[str, str],
+) -> str:
+    """Apply medium candidates only when a second binary verifier says CHANGE."""
+
+    for record in audited:
+        if record.get("decision") != "verify":
+            continue
+        token_id = str(record.get("token_id") or "")
+        verdict = str(votes.get(token_id) or "KEEP").strip().upper()
+        record["verifier_vote"] = verdict
+        if verdict == "CHANGE":
+            record["decision"] = "verified"
+            record["gate"] = "closed_choice_verified"
+            record["applied"] = True
+        else:
+            record["decision"] = "keep"
+            record["gate"] = "closed_choice_verifier_keep"
+            record["applied"] = False
+    return render_applied_ops(item, audited)
+
+
+def _apply_choice_selection(
+    item: DeepQueueItem,
+    raw: dict[str, Any],
+    targeted_ids: set[str],
+) -> dict[str, Any]:
+    token_id = str(raw.get("token_id") or "").strip()
+    choice_id = str(raw.get("choice_id") or "").strip()
+    record: dict[str, Any] = {
+        "kind": "choice",
+        "token_id": token_id or None,
+        "choice_id": choice_id or None,
+        "old": "",
+        "new": "",
+        "confidence": None,
+        "decision": "reject",
+        "gate": "",
+        "applied": False,
+    }
+
+    if not token_id or not choice_id:
+        record["gate"] = "missing_choice_address"
+        return record
+    if token_id in targeted_ids:
+        record["gate"] = "duplicate_token_target"
+        return record
+
+    choice_set = _choice_set(item, token_id)
+    if choice_set is None:
+        record["gate"] = "unknown_token_id"
+        return record
+    selected = _choice(choice_set, choice_id)
+    if selected is None:
+        record["gate"] = "unknown_choice_id"
+        return record
+
+    old = str(choice_set.get("old") or "")
+    record["old"] = old
+    if choice_id == "KEEP":
+        record["new"] = old
+        record["decision"] = "keep"
+        record["gate"] = "closed_choice_keep"
+        targeted_ids.add(token_id)
+        return record
+
+    new = str(selected.get("text") or "")
+    strength = str(selected.get("strength") or "weak")
+    record["new"] = new
+    record["kind"] = str(selected.get("kind") or ("segment" if " " in new else "replace"))
+    record["choice"] = selected
+    record["candidate_strength"] = strength
+    targeted_ids.add(token_id)
+
+    if not new or new == old:
+        record["gate"] = "invalid_local_choice"
+    elif strength == "strong":
+        record["decision"] = "auto"
+        record["gate"] = "closed_choice_strong"
+        record["applied"] = True
+    elif strength == "medium":
+        record["decision"] = "verify"
+        record["gate"] = "closed_choice_needs_second_vote"
+    else:
+        # Weak choices are shown to Deep for diagnostics/contrast but can never
+        # change the book.  In particular, this prevents Vidu -> Vidụ.
+        record["decision"] = "reject"
+        record["gate"] = "weak_local_candidate"
+    return record
 
 
 def apply_ai_ops(
     item: DeepQueueItem,
     ai_ops: list[dict[str, Any]],
     min_confidence: float,
-    max_ops: int = 3,
+    max_ops: int = 5,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Apply only token-local repairs supported by OCR evidence or glyph shape."""
+    """Evaluate closed-choice selections, with legacy free-form compatibility."""
 
-    current = item.current
+    del min_confidence
     audited: list[dict[str, Any]] = []
+    targeted_ids: set[str] = set()
 
     for raw in ai_ops[:max_ops]:
+        if "choice_id" in raw:
+            audited.append(_apply_choice_selection(item, raw, targeted_ids))
+            continue
+
+        # Legacy free-form path retained for existing tests/old experiments.
         old = str(raw.get("old") or "")
         new = str(raw.get("new") or "")
+        token_id_raw = str(raw.get("token_id") or "").strip()
+        token_id = token_id_raw or None
         kind = _operation_kind(raw, new)
         try:
             confidence = float(raw.get("confidence") or 0.0)
@@ -134,9 +295,11 @@ def apply_ai_ops(
 
         record: dict[str, Any] = {
             "kind": kind,
+            "token_id": token_id,
             "old": old,
             "new": new,
             "confidence": confidence,
+            "decision": "reject",
             "gate": "",
             "applied": False,
         }
@@ -152,38 +315,24 @@ def apply_ai_ops(
         elif kind == "segment" and not _valid_segment(old, new):
             record["gate"] = "invalid_segmentation"
         else:
-            _, occurrences = _replace_unique_token(current, old, new)
-            if occurrences != 1:
-                record["gate"] = "old_not_unique_token_in_current"
+            token, token_error = _resolve_token(item.current, old, token_id)
+            if token_error:
+                record["gate"] = token_error
+            elif token is None:
+                record["gate"] = "token_resolution_failed"
+            elif token.token_id in targeted_ids:
+                record["gate"] = "duplicate_token_target"
             else:
-                evidence = _evidence(item, old, new)
-                required = _required_confidence(min_confidence, evidence)
+                evidence = summarize_evidence(item, old, new)
+                decision, label, required = _legacy_decision(kind, old, new, confidence, evidence)
+                record["token_id"] = token.token_id
                 record["evidence"] = evidence.as_dict()
                 record["required_confidence"] = required
-
-                if kind == "segment" and not (evidence.new_votes or evidence.shape_preserving):
-                    record["gate"] = "segmentation_without_visual_or_shape_support"
-                elif required is None:
-                    record["gate"] = "unsupported_new"
-                elif confidence < required:
-                    record["gate"] = "insufficient_confidence_for_evidence"
-                else:
-                    corrected, occurrences = _replace_unique_token(current, old, new)
-                    if occurrences != 1:
-                        record["gate"] = "old_not_unique_token_in_current"
-                    else:
-                        current = corrected
-                        record["gate"] = (
-                            "segmentation_evidence"
-                            if kind == "segment" and evidence.new_votes
-                            else "segmentation_shape"
-                            if kind == "segment"
-                            else "ocr_evidence"
-                            if evidence.new_votes
-                            else "shape_preserving"
-                        )
-                        record["applied"] = True
-
+                record["decision"] = decision
+                record["gate"] = label
+                targeted_ids.add(token.token_id)
+                if decision == "auto":
+                    record["applied"] = True
         audited.append(record)
 
-    return current, audited
+    return render_applied_ops(item, audited), audited
