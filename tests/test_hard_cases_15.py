@@ -40,12 +40,12 @@ def test_01_vidu_shape_safe_segmentation_auto() -> None:
     assert row["decision"] == "auto"
 
 
-def test_02_duplicate_di_uses_token_ids() -> None:
+def test_02_repeated_di_and_four_errors_use_token_ids() -> None:
     item = make(
-        "Muốn di nhanh, hãy di một mình.",
+        "Muốn di nhanh, hãy di một minh. Muốn di xa.",
         meta=[
-            alt("base_ve_25", "whole", "Muốn di nhanh, hãy di một mình.", 95),
-            alt("line_v_p13", "line", "Muốn đi nhanh, hãy đi một mình.", 78),
+            alt("base_ve_25", "whole", "Muốn di nhanh, hãy di một minh. Muốn di xa.", 95),
+            alt("line_v_p13", "line", "Muốn đi nhanh, hãy đi một mình. Muốn đi xa.", 78),
         ],
     )
     corrected, audit = apply_ai_ops(
@@ -53,11 +53,14 @@ def test_02_duplicate_di_uses_token_ids() -> None:
         [
             {"token_id": "t02", "old": "di", "new": "đi", "confidence": 0.99},
             {"token_id": "t05", "old": "di", "new": "đi", "confidence": 0.99},
+            {"token_id": "t07", "old": "minh", "new": "mình", "confidence": 0.99},
+            {"token_id": "t09", "old": "di", "new": "đi", "confidence": 0.99},
         ],
         0.97,
+        max_ops=5,
     )
-    assert corrected == "Muốn đi nhanh, hãy đi một mình."
-    assert [row["decision"] for row in audit] == ["auto", "auto"]
+    assert corrected == "Muốn đi nhanh, hãy đi một mình. Muốn đi xa."
+    assert [row["decision"] for row in audit] == ["auto", "auto", "auto", "auto"]
 
 
 def test_03_de_to_de_context_dominant_goes_verify() -> None:
