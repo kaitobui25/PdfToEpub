@@ -34,8 +34,59 @@ def _chunks(items: list[DeepQueueItem], size: int) -> list[list[DeepQueueItem]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
+def _collapse_ws(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _flexible_phrase_pattern(value: str) -> re.Pattern[str]:
+    """Match a word phrase even when OCR visual lines insert blank lines between words."""
+
+    parts = value.split()
+    body = r"\s+".join(re.escape(part) for part in parts)
+    return re.compile(rf"(?<!\w){body}(?!\w)", re.UNICODE)
+
+
+def _render_corrected_target(
+    item: DeepQueueItem,
+    corrected: str,
+    changes: list[dict[str, Any]],
+) -> str | None:
+    """Project an accepted logical-sentence correction onto the exact TXT span.
+
+    Ordinary sentence-span fixes are patched into the raw OCR span so existing
+    line breaks stay untouched. A strongly OCR-supported whole-sentence recovery
+    is intentionally rendered as one clean sentence because its structure cannot
+    be projected safely token-by-token.
+    """
+
+    applied = [change for change in changes if change.get("applied")]
+    if not applied:
+        return item.output_line if corrected == item.current else None
+
+    if any(change.get("gate") == "sentence_whole_ocr_candidate" for change in applied):
+        return corrected
+
+    rendered = item.output_line
+    for change in applied:
+        if change.get("kind") != "sentence_span":
+            return None
+        old = str(change.get("old") or "").strip()
+        new = str(change.get("new") or "").strip()
+        if not old or not new:
+            return None
+        pattern = _flexible_phrase_pattern(old)
+        matches = list(pattern.finditer(rendered))
+        if len(matches) != 1:
+            return None
+        rendered = pattern.sub(lambda _: new, rendered, count=1)
+
+    if _collapse_ws(rendered) != _collapse_ws(corrected):
+        return None
+    return rendered
+
+
 def _patch_exact_lines(text: str, replacements: dict[str, str]) -> tuple[str, int, int]:
-    """Patch globally unique exact sentence substrings in the final text."""
+    """Patch globally unique exact raw sentence spans in the final text."""
 
     patched = 0
     missed = 0
@@ -85,10 +136,12 @@ def run_deep_only(
     deep_epub = layout.deep_epub if not suffix else layout.root / f"{layout.stem}_V4_LOCAL_TURBO_DEEP{suffix}.epub"
     queue_path = layout.root / f"deep_ai_queue{suffix}.json"
     audit_path = layout.root / f"deep_ai_audit{suffix}.json"
+    skipped_path = layout.root / f"deep_ai_skipped{suffix}.json"
     summary_path = layout.root / f"SUMMARY_DEEP_ONLY{suffix}.json"
 
-    queue, skipped = build_queue(layout.local_txt, local_audit, page_start=page_start, page_end=page_end)
+    queue, skipped_records = build_queue(layout.local_txt, local_audit, page_start=page_start, page_end=page_end)
     write_json(queue_path, [item.as_dict() for item in queue])
+    write_json(skipped_path, skipped_records)
 
     opencode = find_opencode()
     if opencode is None:
@@ -103,7 +156,7 @@ def run_deep_only(
         log(f"Deep page filter: PDF {page_start}..{page_end}; OCR source remains the full local run")
     log(
         f"Sentence queue: {len(queue)} sentences from {source_lines} unresolved source lines; "
-        f"skipped_lines={skipped}"
+        f"skipped_lines={len(skipped_records)}"
     )
     log(f"Micro-batch: {config.batch_size} sentences; parallel AI workers: {config.workers}")
     log(f"AI calls: {len(batches)} total, max {config.workers} concurrent")
@@ -175,6 +228,7 @@ def run_deep_only(
     replacements: dict[str, str] = {}
     applied_sentences = 0
     applied_spans = 0
+    projection_failures = 0
     for item in queue:
         ai_raw = ai_by_id.get(
             item.item_id,
@@ -186,21 +240,37 @@ def run_deep_only(
             config.min_apply_confidence,
             max_changed_words=max(6, config.max_ops_per_item * 2),
         )
-        changed = corrected != item.current
-        if changed:
-            replacements[item.output_line] = corrected
-            applied_sentences += 1
-            applied_spans += sum(1 for change in changes if change.get("applied"))
+        gate_changed = corrected != item.current
+        rendered: str | None = None
+        txt_applied = False
+        if gate_changed:
+            rendered = _render_corrected_target(item, corrected, changes)
+            if rendered is None:
+                projection_failures += 1
+            else:
+                replacements[item.output_line] = rendered
+                applied_sentences += 1
+                applied_spans += sum(1 for change in changes if change.get("applied"))
+                txt_applied = True
         audit.append(
             {
                 "id": item.item_id,
                 "page": [item.page_number, item.side],
                 "source_ids": item.source_ids,
                 "current": item.current,
+                "raw_target": item.output_line,
+                "context_window": item.context,
                 "corrected": corrected,
                 "changes": changes,
-                "applied_sentence": changed,
-                "txt_gate": "applied_atomic_sentence" if changed else "keep_local",
+                "gate_accepted_sentence": gate_changed,
+                "applied_sentence": txt_applied,
+                "txt_gate": (
+                    "applied_atomic_sentence"
+                    if txt_applied
+                    else "patch_projection_failed"
+                    if gate_changed
+                    else "keep_local"
+                ),
                 "ai_raw": ai_raw,
             }
         )
@@ -213,14 +283,16 @@ def run_deep_only(
 
     total = time.perf_counter() - start
     summary = {
-        "mode": "deep-only-sentence-atomic",
+        "mode": "deep-only-sentence-atomic-3context",
         "source": str(layout.root),
         "model": config.model,
         "queue_unit": "sentence",
+        "context_window": "previous+target+next; target-only editable",
         "page_filter": [page_start, page_end] if suffix else None,
         "queue_items": len(queue),
         "queue_source_lines": source_lines,
-        "skipped_items": skipped,
+        "skipped_items": len(skipped_records),
+        "skipped_audit": str(skipped_path),
         "ai_batch_size": config.batch_size,
         "ai_workers": config.workers,
         "ai_calls": len(batches),
@@ -230,6 +302,7 @@ def run_deep_only(
         "ai_sum_call_seconds": round(sum(call_seconds), 3),
         "applied_sentences": applied_sentences,
         "applied_spans": applied_spans,
+        "patch_projection_failures": projection_failures,
         "epub_patch": {"patched_sentences": patched, "missed_sentences": missed},
         "total_seconds": round(total, 3),
         "local_txt_untouched": str(layout.local_txt),
