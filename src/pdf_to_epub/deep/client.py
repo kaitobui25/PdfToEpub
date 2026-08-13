@@ -13,6 +13,7 @@ from typing import Any
 
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 FENCE_RE = re.compile(r"```(?:json)?\s*([\[{].*?[\]}])\s*```", re.DOTALL | re.IGNORECASE)
+MAX_RESPONSE_ATTEMPTS = 3
 
 
 def find_opencode() -> Path | None:
@@ -89,6 +90,19 @@ def extract_json(output: str) -> Any:
     raise ValueError("OpenCode output did not contain valid JSON")
 
 
+def _normalize_response(value: Any) -> dict[str, Any]:
+    """Require the exact Deep response container so partial nested JSON is never accepted."""
+
+    if isinstance(value, list) and all(isinstance(row, dict) for row in value):
+        return {"items": value}
+    if not isinstance(value, dict):
+        raise ValueError(f"DeepSeek response must be a JSON object or item array, got {type(value).__name__}")
+    items = value.get("items")
+    if not isinstance(items, list) or not all(isinstance(row, dict) for row in items):
+        raise ValueError("DeepSeek response must contain an 'items' array of objects")
+    return value
+
+
 def deepseek_call(
     opencode: Path,
     model: str,
@@ -103,6 +117,9 @@ def deepseek_call(
     ``database_path`` isolates concurrent OpenCode processes from the shared
     SQLite session database. Provider/auth configuration remains shared through
     OpenCode's normal config/auth files.
+
+    Malformed model JSON is transient, so only that individual OpenCode call is
+    retried. Successful parallel batches are never repeated by this retry loop.
     """
 
     workdir = workdir.resolve()
@@ -117,28 +134,34 @@ def deepseek_call(
         database_path.parent.mkdir(parents=True, exist_ok=True)
         env_overrides["OPENCODE_DB"] = str(database_path.resolve())
 
-    cp = run_exe(
-        opencode,
-        [
-            "run",
-            "--model",
-            model,
-            "--dir",
-            str(workdir),
-            "Read the attached UTF-8 instruction file and follow it exactly. Return ONLY the requested JSON. Do not use tools.",
-            "--file",
-            str(prompt_file),
-        ],
-        timeout=timeout,
-        cwd=workdir,
-        env_overrides=env_overrides,
-    )
-    combined = (cp.stdout or "") + "\n" + (cp.stderr or "")
-    if cp.returncode != 0:
-        raise RuntimeError(f"OpenCode call failed ({cp.returncode}): {combined[:4000]}")
-    value = extract_json(combined)
-    if isinstance(value, list) and all(isinstance(row, dict) for row in value):
-        return {"items": value}
-    if not isinstance(value, dict):
-        raise ValueError(f"DeepSeek response must be a JSON object or item array, got {type(value).__name__}")
-    return value
+    command = [
+        "run",
+        "--model",
+        model,
+        "--dir",
+        str(workdir),
+        "Read the attached UTF-8 instruction file and follow it exactly. Return ONLY the requested JSON. Do not use tools.",
+        "--file",
+        str(prompt_file),
+    ]
+
+    last_response_error: ValueError | None = None
+    for _attempt in range(1, MAX_RESPONSE_ATTEMPTS + 1):
+        cp = run_exe(
+            opencode,
+            command,
+            timeout=timeout,
+            cwd=workdir,
+            env_overrides=env_overrides,
+        )
+        combined = (cp.stdout or "") + "\n" + (cp.stderr or "")
+        if cp.returncode != 0:
+            raise RuntimeError(f"OpenCode call failed ({cp.returncode}): {combined[:4000]}")
+        try:
+            return _normalize_response(extract_json(combined))
+        except ValueError as exc:
+            last_response_error = exc
+
+    raise ValueError(
+        f"DeepSeek returned invalid JSON after {MAX_RESPONSE_ATTEMPTS} attempts: {last_response_error}"
+    ) from last_response_error
