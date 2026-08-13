@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from math import ceil
 from pathlib import Path
 import re
+from statistics import median
 from typing import Any
 
 from ..jsonio import read_json
 from ..models import DeepQueueItem
-
 
 MARKER_RE = re.compile(r"^===== PDF(\d{3})-([LR]) =====$")
 LEXICAL_RE = re.compile(r"[0-9A-Za-zÀ-ỹĐđ]+", re.UNICODE)
@@ -84,10 +85,80 @@ def _resolve_target(page_lines: list[str], current: str) -> str | None:
     return None
 
 
+def _best_candidate_confidence(row: dict[str, Any]) -> float:
+    values: list[float] = []
+    for key in ("whole_candidates", "line_candidates"):
+        for candidate in row.get(key, []):
+            try:
+                values.append(float(candidate.get("conf") or 0.0))
+            except (TypeError, ValueError):
+                continue
+    return max(values, default=0.0)
+
+
+def find_legacy_catastrophic_sides(audit: list[dict[str, Any]]) -> set[tuple[int, str]]:
+    """Detect collapsed sides in old LOCAL outputs that predate health.py.
+
+    This is intentionally a high-precision guard, not a replacement for the
+    pixel-based whole-side health detector. It only suppresses Deep token repair
+    when a side has many low-confidence suspect rows and the median best OCR
+    evidence is itself poor.
+    """
+
+    grouped: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in audit:
+        try:
+            key = (int(row["page"][0]), str(row["page"][1]))
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+        grouped[key].append(row)
+
+    bad: set[tuple[int, str]] = set()
+    for key, rows in grouped.items():
+        if any("whole_side_catastrophe" in list(row.get("reasons") or []) for row in rows):
+            bad.add(key)
+            continue
+        if len(rows) < 6:
+            continue
+
+        best_confidences = [_best_candidate_confidence(row) for row in rows]
+        severe = 0
+        for row, best_conf in zip(rows, best_confidences):
+            reasons = list(row.get("reasons") or [])
+            has_non_dictionary = any(str(reason).startswith("non_dictionary:") for reason in reasons)
+            if "low_word_conf" in reasons and (best_conf < 70.0 or has_non_dictionary):
+                severe += 1
+
+        if severe >= max(4, ceil(len(rows) * 0.55)) and median(best_confidences) < 75.0:
+            bad.add(key)
+    return bad
+
+
+def _candidate_metadata(row: dict[str, Any]) -> list[dict[str, Any]]:
+    """Preserve source/confidence metadata for local weighted evidence scoring."""
+
+    result: list[dict[str, Any]] = []
+    for key in ("line_candidates", "whole_candidates"):
+        for candidate in row.get(key, []):
+            text = str(candidate.get("text") or "").strip()
+            if not text:
+                continue
+            result.append({
+                "source": str(candidate.get("source") or ""),
+                "kind": str(candidate.get("kind") or ("line" if key == "line_candidates" else "whole")),
+                "text": text,
+                "conf": candidate.get("conf", 0.0),
+                "psm": candidate.get("psm"),
+                "scale": candidate.get("scale"),
+            })
+    return result
+
+
 def build_queue(local_txt: Path, local_refine_audit: Path) -> tuple[list[DeepQueueItem], int]:
     output = local_txt.read_text(encoding="utf-8")
     pages = _flatten_output_lines(output)
     audit: list[dict[str, Any]] = read_json(local_refine_audit)
+    legacy_catastrophic = find_legacy_catastrophic_sides(audit)
     queue: list[DeepQueueItem] = []
     skipped = 0
 
@@ -95,15 +166,14 @@ def build_queue(local_txt: Path, local_refine_audit: Path) -> tuple[list[DeepQue
         reasons = list(row.get("reasons") or [])
         if not reasons or row.get("edits"):
             continue
-        # A collapsed page must be repaired from pixels, not guessed token by
-        # token by a language model. health.py already attempted whole-side rescue.
-        if "whole_side_catastrophe" in reasons:
+
+        page_number, side = int(row["page"][0]), str(row["page"][1])
+        if "whole_side_catastrophe" in reasons or (page_number, side) in legacy_catastrophic:
             skipped += 1
             continue
         if _trusted_stable(row):
             continue
 
-        page_number, side = int(row["page"][0]), str(row["page"][1])
         current = str(row.get("after") or row.get("before") or "").strip()
         if not current:
             skipped += 1
@@ -121,12 +191,13 @@ def build_queue(local_txt: Path, local_refine_audit: Path) -> tuple[list[DeepQue
                 skipped += 1
                 continue
 
+        metadata = _candidate_metadata(row)
         candidates: list[str] = []
-        for source_key in ("line_candidates", "whole_candidates"):
-            for candidate in row.get(source_key, []):
-                text = str(candidate.get("text") or "").strip()
-                if text and _lexical(text) != _lexical(current) and text not in candidates:
-                    candidates.append(text)
+        for candidate in metadata:
+            text = str(candidate["text"])
+            if _lexical(text) != _lexical(current) and text not in candidates:
+                candidates.append(text)
+
         queue.append(
             DeepQueueItem(
                 item_id=str(row["id"]),
@@ -137,6 +208,7 @@ def build_queue(local_txt: Path, local_refine_audit: Path) -> tuple[list[DeepQue
                 context=_context(page_lines, target),
                 reasons=reasons,
                 candidates=candidates[:8],
+                candidate_meta=metadata,
             )
         )
     return queue, skipped
