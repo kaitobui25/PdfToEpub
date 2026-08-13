@@ -35,12 +35,7 @@ def _chunks(items: list[DeepQueueItem], size: int) -> list[list[DeepQueueItem]]:
 
 
 def _patch_exact_lines(text: str, replacements: dict[str, str]) -> tuple[str, int, int]:
-    """Patch exact OCR substrings inside final paragraph lines.
-
-    Sentence queue targets are globally unique exact substrings. A target is
-    still applied only when it occurs once in the final document, preserving the
-    same last-resort safety rule used by the token pipeline.
-    """
+    """Patch globally unique exact sentence substrings in the final text."""
 
     patched = 0
     missed = 0
@@ -55,16 +50,26 @@ def _patch_exact_lines(text: str, replacements: dict[str, str]) -> tuple[str, in
 
 
 def _worker_database(root: Path) -> Path:
-    """Return one private OpenCode SQLite DB per executor worker for this run."""
-
     worker = re.sub(r"[^A-Za-z0-9_.-]+", "_", threading.current_thread().name)
     return root / f"run_{os.getpid()}_{worker}.db"
+
+
+def _range_suffix(page_start: int | None, page_end: int | None) -> str:
+    if page_start is None and page_end is None:
+        return ""
+    if page_start is None or page_end is None:
+        raise ValueError("Deep page range requires both start and end")
+    if page_start > page_end:
+        raise ValueError("Deep page range start must be <= end")
+    return f"_{page_start:03d}_{page_end:03d}"
 
 
 def run_deep_only(
     layout: OutputLayout,
     config: DeepConfig,
     log: Callable[[str], None],
+    page_start: int | None = None,
+    page_end: int | None = None,
 ) -> DeepResult:
     """Run DeepSeek against existing local artifacts; never touch OCR/Tesseract."""
 
@@ -75,8 +80,15 @@ def run_deep_only(
     if not local_audit.exists():
         raise FileNotFoundError(f"Local refinement audit not found: {local_audit}")
 
-    queue, skipped = build_queue(layout.local_txt, local_audit)
-    write_json(layout.root / "deep_ai_queue.json", [item.as_dict() for item in queue])
+    suffix = _range_suffix(page_start, page_end)
+    deep_txt = layout.deep_txt if not suffix else layout.root / f"{layout.stem}_V4_LOCAL_TURBO_DEEP{suffix}.txt"
+    deep_epub = layout.deep_epub if not suffix else layout.root / f"{layout.stem}_V4_LOCAL_TURBO_DEEP{suffix}.epub"
+    queue_path = layout.root / f"deep_ai_queue{suffix}.json"
+    audit_path = layout.root / f"deep_ai_audit{suffix}.json"
+    summary_path = layout.root / f"SUMMARY_DEEP_ONLY{suffix}.json"
+
+    queue, skipped = build_queue(layout.local_txt, local_audit, page_start=page_start, page_end=page_end)
+    write_json(queue_path, [item.as_dict() for item in queue])
 
     opencode = find_opencode()
     if opencode is None:
@@ -87,6 +99,8 @@ def run_deep_only(
 
     source_lines = sum(len(item.source_ids) or 1 for item in queue)
     batches = _chunks(queue, config.batch_size)
+    if suffix:
+        log(f"Deep page filter: PDF {page_start}..{page_end}; OCR source remains the full local run")
     log(
         f"Sentence queue: {len(queue)} sentences from {source_lines} unresolved source lines; "
         f"skipped_lines={skipped}"
@@ -116,7 +130,7 @@ def run_deep_only(
                     config.model,
                     build_prompt(batch),
                     layout.deep_work_dir,
-                    f"deep_micro_{index:03d}",
+                    f"deep_micro{suffix}_{index:03d}",
                     config.call_timeout_seconds,
                     database_path=database_path,
                 )
@@ -145,7 +159,7 @@ def run_deep_only(
                         ai_by_id[str(row["id"])] = row
                 retry_suffix = f" retries={retries}" if retries else ""
                 log(f"[AI {index:03d}/{len(batches):03d}] sentences={len(batch)} time={elapsed:.2f}s{retry_suffix}")
-            except Exception as exc:  # keep remaining independent batches running
+            except Exception as exc:
                 failed_calls += 1
                 log(f"[AI FAIL] {exc}")
 
@@ -164,11 +178,7 @@ def run_deep_only(
     for item in queue:
         ai_raw = ai_by_id.get(
             item.item_id,
-            {
-                "id": item.item_id,
-                "corrected_sentence": item.current,
-                "confidence": 0.0,
-            },
+            {"id": item.item_id, "corrected_sentence": item.current, "confidence": 0.0},
         )
         corrected, changes = apply_ai_sentence(
             item,
@@ -197,9 +207,9 @@ def run_deep_only(
 
     local_text = layout.local_txt.read_text(encoding="utf-8")
     deep_text, patched, missed = _patch_exact_lines(local_text, replacements)
-    write_text(layout.deep_txt, deep_text)
-    write_epub(layout.deep_epub, f"{layout.stem} — V4 LOCAL TURBO + DeepSeek", sides_from_text(deep_text))
-    write_json(layout.root / "deep_ai_audit.json", audit)
+    write_text(deep_txt, deep_text)
+    write_epub(deep_epub, f"{layout.stem} — V4 LOCAL TURBO + DeepSeek{suffix}", sides_from_text(deep_text))
+    write_json(audit_path, audit)
 
     total = time.perf_counter() - start
     summary = {
@@ -207,6 +217,7 @@ def run_deep_only(
         "source": str(layout.root),
         "model": config.model,
         "queue_unit": "sentence",
+        "page_filter": [page_start, page_end] if suffix else None,
         "queue_items": len(queue),
         "queue_source_lines": source_lines,
         "skipped_items": skipped,
@@ -223,9 +234,9 @@ def run_deep_only(
         "total_seconds": round(total, 3),
         "local_txt_untouched": str(layout.local_txt),
         "local_epub_untouched": str(layout.local_epub),
-        "deep_txt": str(layout.deep_txt),
-        "deep_epub": str(layout.deep_epub),
-        "audit": str(layout.root / "deep_ai_audit.json"),
+        "deep_txt": str(deep_txt),
+        "deep_epub": str(deep_epub),
+        "audit": str(audit_path),
     }
-    write_json(layout.root / "SUMMARY_DEEP_ONLY.json", summary)
+    write_json(summary_path, summary)
     return DeepResult(summary=summary, audit=audit)
