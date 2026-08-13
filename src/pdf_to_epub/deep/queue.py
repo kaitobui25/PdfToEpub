@@ -137,12 +137,17 @@ def _candidate_texts(row: dict[str, Any], current: str) -> list[str]:
     return candidates
 
 
-def build_queue(local_txt: Path, local_refine_audit: Path) -> tuple[list[DeepQueueItem], int]:
+def build_queue(
+    local_txt: Path,
+    local_refine_audit: Path,
+    page_start: int | None = None,
+    page_end: int | None = None,
+) -> tuple[list[DeepQueueItem], int]:
     """Group suspect OCR lines by their containing sentence.
 
-    Deep receives the complete sentence, while source_ids preserve which local
-    OCR rows contributed evidence. A sentence is queued only when its exact text
-    occurs once in the book, keeping the final patch deterministic and safe.
+    ``page_start``/``page_end`` filter only the Deep validation queue. The source
+    TXT/audit can still cover the complete OCR run, so a small Deep test never
+    requires rerunning or copying Tesseract artifacts.
     """
 
     output = local_txt.read_text(encoding="utf-8")
@@ -152,18 +157,21 @@ def build_queue(local_txt: Path, local_refine_audit: Path) -> tuple[list[DeepQue
     groups: dict[tuple[int, str, str], dict[str, Any]] = {}
 
     for row in audit:
+        page_number, side = int(row["page"][0]), str(row["page"][1])
+        if page_start is not None and page_number < page_start:
+            continue
+        if page_end is not None and page_number > page_end:
+            continue
+
         reasons = list(row.get("reasons") or [])
         if not reasons or row.get("edits"):
             continue
-        # Collapsed/symbol-soup OCR must be recovered from pixels, never guessed
-        # by a language model at sentence level.
         if "whole_side_catastrophe" in reasons:
             skipped += 1
             continue
         if _trusted_stable(row):
             continue
 
-        page_number, side = int(row["page"][0]), str(row["page"][1])
         current = str(row.get("after") or row.get("before") or "").strip()
         if not current:
             skipped += 1
@@ -208,8 +216,6 @@ def build_queue(local_txt: Path, local_refine_audit: Path) -> tuple[list[DeepQue
     queue: list[DeepQueueItem] = []
     side_counts: dict[tuple[int, str], int] = defaultdict(int)
     for (page_number, side, sentence), group in groups.items():
-        # Sentence replacement is atomic. Refuse ambiguous repeated strings so
-        # _patch_exact_lines can never alter the wrong occurrence elsewhere.
         if not sentence or output.count(sentence) != 1:
             skipped += len(group["source_ids"])
             continue
