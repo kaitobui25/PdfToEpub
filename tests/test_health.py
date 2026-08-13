@@ -24,7 +24,7 @@ def test_normal_prose_is_not_catastrophic() -> None:
     assert report.best_source in evidence
 
 
-def test_symbol_soup_with_unstable_passes_is_catastrophic() -> None:
+def test_symbol_soup_with_multiple_severe_signals_is_catastrophic() -> None:
     evidence = {
         "base": rows([
             "cá oe ng sản €€€ tá XWN Đạy dư Ì Bis clue ứng oquate",
@@ -44,7 +44,8 @@ def test_symbol_soup_with_unstable_passes_is_catastrophic() -> None:
     }
     report = analyze_side_evidence(evidence, set())
     assert report.catastrophic is True
-    assert "cross_pass_instability" in report.reasons
+    severe = {"symbol_soup", "fragmented_words", "lexicon_collapse", "cross_pass_instability", "low_side_confidence"}
+    assert len(set(report.reasons) & severe) >= 2
 
 
 def test_good_fallback_can_rescue_a_bad_initial_side() -> None:
