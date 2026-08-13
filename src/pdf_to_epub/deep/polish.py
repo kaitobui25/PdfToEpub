@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import os
@@ -22,6 +23,7 @@ from .queue import build_queue
 
 
 LOCK_RETRY_DELAYS = (0.75, 1.5, 3.0, 6.0)
+ATOMIC_FOLLOWUP_GATE = "atomic_rejected_due_to_other_span"
 
 
 @dataclass(slots=True)
@@ -51,19 +53,16 @@ def _render_corrected_target(
     corrected: str,
     changes: list[dict[str, Any]],
 ) -> str | None:
-    """Project an accepted logical-sentence correction onto the exact TXT span.
-
-    Ordinary sentence-span fixes are patched into the raw OCR span so existing
-    line breaks stay untouched. A strongly OCR-supported whole-sentence recovery
-    is intentionally rendered as one clean sentence because its structure cannot
-    be projected safely token-by-token.
-    """
+    """Project an accepted logical-sentence correction onto the exact TXT span."""
 
     applied = [change for change in changes if change.get("applied")]
     if not applied:
         return item.output_line if corrected == item.current else None
 
-    if any(change.get("gate") == "sentence_whole_ocr_candidate" for change in applied):
+    if any(
+        change.get("gate") in {"sentence_whole_ocr_candidate", "sentence_deep_trust_structural"}
+        for change in applied
+    ):
         return corrected
 
     rendered = item.output_line
@@ -115,6 +114,41 @@ def _range_suffix(page_start: int | None, page_end: int | None) -> str:
     return f"_{page_start:03d}_{page_end:03d}"
 
 
+def _block_reasons(changes: list[dict[str, Any]]) -> list[str]:
+    """Return root gate reasons, hiding atomic follow-up noise when possible."""
+
+    gates = [str(change.get("gate") or "") for change in changes if not change.get("applied") and change.get("gate")]
+    roots = [gate for gate in gates if gate != ATOMIC_FOLLOWUP_GATE]
+    return roots or gates
+
+
+def _log_result_summary(log: Callable[[str], None], summary: dict[str, Any]) -> None:
+    log("")
+    log("================ DEEP RESULT ================")
+    log(f"Deep trust            : {summary['deep_trust']}")
+    log(f"Suspect TARGETs       : {summary['queue_items']} ({summary['queue_source_lines']} OCR source lines)")
+    log(
+        f"Deep proposed changes : {summary['deep_proposed_sentences']} TARGETs / "
+        f"{summary['deep_proposed_repair_groups']} repair groups"
+    )
+    log(
+        f"Applied to TXT        : {summary['applied_sentences']} TARGETs / "
+        f"{summary['applied_spans']} repair groups"
+    )
+    log(f"Blocked by gate       : {summary['gate_blocked_sentences']} TARGETs")
+    log(f"Patch projection fail : {summary['patch_projection_failures']} TARGETs")
+    log(f"Deep kept unchanged   : {summary['deep_unchanged_sentences']} TARGETs")
+    log(f"Skipped before Deep   : {summary['skipped_items']} items")
+    reasons = summary.get("block_reasons") or {}
+    if reasons:
+        log("Block reasons:")
+        for reason, count in sorted(reasons.items(), key=lambda pair: (-pair[1], pair[0])):
+            log(f"  - {reason}: {count}")
+    else:
+        log("Block reasons         : none")
+    log("=============================================")
+
+
 def run_deep_only(
     layout: OutputLayout,
     config: DeepConfig,
@@ -158,6 +192,7 @@ def run_deep_only(
         f"Sentence queue: {len(queue)} sentences from {source_lines} unresolved source lines; "
         f"skipped_lines={len(skipped_records)}"
     )
+    log(f"Deep trust: {config.deep_trust}")
     log(f"Micro-batch: {config.batch_size} sentences; parallel AI workers: {config.workers}")
     log(f"AI calls: {len(batches)} total, max {config.workers} concurrent")
 
@@ -229,18 +264,39 @@ def run_deep_only(
     applied_sentences = 0
     applied_spans = 0
     projection_failures = 0
+    deep_proposed_sentences = 0
+    deep_proposed_repair_groups = 0
+    deep_unchanged_sentences = 0
+    gate_blocked_sentences = 0
+    block_reasons: Counter[str] = Counter()
+
     for item in queue:
         ai_raw = ai_by_id.get(
             item.item_id,
             {"id": item.item_id, "corrected_sentence": item.current, "confidence": 0.0},
         )
+        proposed = str(ai_raw.get("corrected_sentence") or item.current).strip() if isinstance(ai_raw, dict) else item.current
+        ai_changed = proposed != item.current.strip()
+        if ai_changed:
+            deep_proposed_sentences += 1
+        else:
+            deep_unchanged_sentences += 1
+
         corrected, changes = apply_ai_sentence(
             item,
             ai_raw,
             config.min_apply_confidence,
             max_changed_words=max(6, config.max_ops_per_item * 2),
+            deep_trust=config.deep_trust,
         )
+        if ai_changed:
+            deep_proposed_repair_groups += max(1, len(changes))
+
         gate_changed = corrected != item.current
+        if ai_changed and not gate_changed:
+            gate_blocked_sentences += 1
+            block_reasons.update(set(_block_reasons(changes)))
+
         rendered: str | None = None
         txt_applied = False
         if gate_changed:
@@ -262,6 +318,8 @@ def run_deep_only(
                 "context_window": item.context,
                 "corrected": corrected,
                 "changes": changes,
+                "deep_trust": config.deep_trust,
+                "deep_proposed_change": ai_changed,
                 "gate_accepted_sentence": gate_changed,
                 "applied_sentence": txt_applied,
                 "txt_gate": (
@@ -286,6 +344,7 @@ def run_deep_only(
         "mode": "deep-only-sentence-atomic-3context",
         "source": str(layout.root),
         "model": config.model,
+        "deep_trust": config.deep_trust,
         "queue_unit": "sentence",
         "context_window": "previous+target+next; target-only editable",
         "page_filter": [page_start, page_end] if suffix else None,
@@ -300,6 +359,11 @@ def run_deep_only(
         "ai_database_lock_retries": lock_retries,
         "ai_wall_seconds": round(ai_wall, 3),
         "ai_sum_call_seconds": round(sum(call_seconds), 3),
+        "deep_proposed_sentences": deep_proposed_sentences,
+        "deep_proposed_repair_groups": deep_proposed_repair_groups,
+        "deep_unchanged_sentences": deep_unchanged_sentences,
+        "gate_blocked_sentences": gate_blocked_sentences,
+        "block_reasons": dict(sorted(block_reasons.items())),
         "applied_sentences": applied_sentences,
         "applied_spans": applied_spans,
         "patch_projection_failures": projection_failures,
@@ -312,4 +376,5 @@ def run_deep_only(
         "audit": str(audit_path),
     }
     write_json(summary_path, summary)
+    _log_result_summary(log, summary)
     return DeepResult(summary=summary, audit=audit)
