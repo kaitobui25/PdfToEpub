@@ -1,4 +1,4 @@
-"""Standalone Deep-only orchestration: queue → parallel AI → gate → patch."""
+"""Standalone Deep-only orchestration: sentence queue → parallel AI → gate → patch."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from ..epub import sides_from_text, write_epub
 from ..jsonio import write_json, write_text
 from ..models import DeepQueueItem
 from .client import deepseek_call, find_opencode, run_exe
-from .gate import apply_ai_ops
+from .gate import apply_ai_sentence
 from .prompt import build_prompt
 from .queue import build_queue
 
@@ -37,9 +37,9 @@ def _chunks(items: list[DeepQueueItem], size: int) -> list[list[DeepQueueItem]]:
 def _patch_exact_lines(text: str, replacements: dict[str, str]) -> tuple[str, int, int]:
     """Patch exact OCR substrings inside final paragraph lines.
 
-    LOCAL_TURBO may join several visual OCR lines into one paragraph. Therefore
-    the patch target is an exact substring, not necessarily the entire TXT line.
-    A target is applied only when it occurs once in the document.
+    Sentence queue targets are globally unique exact substrings. A target is
+    still applied only when it occurs once in the final document, preserving the
+    same last-resort safety rule used by the token pipeline.
     """
 
     patched = 0
@@ -85,9 +85,13 @@ def run_deep_only(
     if version.returncode != 0:
         raise RuntimeError("opencode --version failed")
 
+    source_lines = sum(len(item.source_ids) or 1 for item in queue)
     batches = _chunks(queue, config.batch_size)
-    log(f"Queue: {len(queue)} unresolved lines; skipped={skipped}")
-    log(f"Micro-batch: {config.batch_size} items; parallel AI workers: {config.workers}")
+    log(
+        f"Sentence queue: {len(queue)} sentences from {source_lines} unresolved source lines; "
+        f"skipped_lines={skipped}"
+    )
+    log(f"Micro-batch: {config.batch_size} sentences; parallel AI workers: {config.workers}")
     log(f"AI calls: {len(batches)} total, max {config.workers} concurrent")
 
     ai_by_id: dict[str, dict[str, Any]] = {}
@@ -140,7 +144,7 @@ def run_deep_only(
                     if isinstance(row, dict) and row.get("id"):
                         ai_by_id[str(row["id"])] = row
                 retry_suffix = f" retries={retries}" if retries else ""
-                log(f"[AI {index:03d}/{len(batches):03d}] items={len(batch)} time={elapsed:.2f}s{retry_suffix}")
+                log(f"[AI {index:03d}/{len(batches):03d}] sentences={len(batch)} time={elapsed:.2f}s{retry_suffix}")
             except Exception as exc:  # keep remaining independent batches running
                 failed_calls += 1
                 log(f"[AI FAIL] {exc}")
@@ -155,29 +159,41 @@ def run_deep_only(
 
     audit: list[dict[str, Any]] = []
     replacements: dict[str, str] = {}
-    applied_lines = 0
-    applied_ops = 0
+    applied_sentences = 0
+    applied_spans = 0
     for item in queue:
-        ai_raw = ai_by_id.get(item.item_id, {"id": item.item_id, "ops": []})
-        raw_ops = ai_raw.get("ops") if isinstance(ai_raw, dict) else []
-        if not isinstance(raw_ops, list):
-            raw_ops = []
-        corrected, ops = apply_ai_ops(item, raw_ops, config.min_apply_confidence, config.max_ops_per_item)
+        ai_raw = ai_by_id.get(
+            item.item_id,
+            {
+                "id": item.item_id,
+                "corrected_sentence": item.current,
+                "confidence": 0.0,
+            },
+        )
+        corrected, changes = apply_ai_sentence(
+            item,
+            ai_raw,
+            config.min_apply_confidence,
+            max_changed_words=max(6, config.max_ops_per_item * 2),
+        )
         changed = corrected != item.current
         if changed:
             replacements[item.output_line] = corrected
-            applied_lines += 1
-            applied_ops += sum(1 for op in ops if op.get("applied"))
-        audit.append({
-            "id": item.item_id,
-            "page": [item.page_number, item.side],
-            "current": item.current,
-            "corrected": corrected,
-            "ops": ops,
-            "applied_line": changed,
-            "txt_gate": "applied" if changed else "no_change",
-            "ai_raw": ai_raw,
-        })
+            applied_sentences += 1
+            applied_spans += sum(1 for change in changes if change.get("applied"))
+        audit.append(
+            {
+                "id": item.item_id,
+                "page": [item.page_number, item.side],
+                "source_ids": item.source_ids,
+                "current": item.current,
+                "corrected": corrected,
+                "changes": changes,
+                "applied_sentence": changed,
+                "txt_gate": "applied_atomic_sentence" if changed else "keep_local",
+                "ai_raw": ai_raw,
+            }
+        )
 
     local_text = layout.local_txt.read_text(encoding="utf-8")
     deep_text, patched, missed = _patch_exact_lines(local_text, replacements)
@@ -187,10 +203,12 @@ def run_deep_only(
 
     total = time.perf_counter() - start
     summary = {
-        "mode": "deep-only",
+        "mode": "deep-only-sentence-atomic",
         "source": str(layout.root),
         "model": config.model,
+        "queue_unit": "sentence",
         "queue_items": len(queue),
+        "queue_source_lines": source_lines,
         "skipped_items": skipped,
         "ai_batch_size": config.batch_size,
         "ai_workers": config.workers,
@@ -199,9 +217,9 @@ def run_deep_only(
         "ai_database_lock_retries": lock_retries,
         "ai_wall_seconds": round(ai_wall, 3),
         "ai_sum_call_seconds": round(sum(call_seconds), 3),
-        "applied_lines": applied_lines,
-        "applied_ops": applied_ops,
-        "epub_patch": {"patched_lines": patched, "missed_lines": missed},
+        "applied_sentences": applied_sentences,
+        "applied_spans": applied_spans,
+        "epub_patch": {"patched_sentences": patched, "missed_sentences": missed},
         "total_seconds": round(total, 3),
         "local_txt_untouched": str(layout.local_txt),
         "local_epub_untouched": str(layout.local_epub),
