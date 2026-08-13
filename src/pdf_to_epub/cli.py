@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 
 from .config import DEEP_TRUST_LEVELS, ON_OFF_CHOICES, PATCH_PROJECTION_MODES, DeepConfig, LocalTurboConfig
-from .deep.polish import run_deep_only
+from .deep.runtime import run_deep_only
 from .logging_utils import RunLogger
 from .pipeline import make_layout, run_local_turbo
 
