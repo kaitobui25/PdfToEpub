@@ -105,10 +105,6 @@ def deepseek_call(
     OpenCode's normal config/auth files.
     """
 
-    # OpenCode receives both cwd=workdir and --dir workdir. If workdir remains
-    # relative, the child process resolves --dir again from inside workdir and
-    # ends up looking for e.g. _deep_work/runs/.../_deep_work. Resolve once at
-    # the process boundary so --dir, --file, cwd and worker DB are unambiguous.
     workdir = workdir.resolve()
     prompt_dir = workdir / "prompts"
     prompt_dir.mkdir(parents=True, exist_ok=True)
@@ -141,6 +137,8 @@ def deepseek_call(
     if cp.returncode != 0:
         raise RuntimeError(f"OpenCode call failed ({cp.returncode}): {combined[:4000]}")
     value = extract_json(combined)
+    if isinstance(value, list) and all(isinstance(row, dict) for row in value):
+        return {"items": value}
     if not isinstance(value, dict):
-        raise ValueError("DeepSeek response must be a JSON object")
+        raise ValueError(f"DeepSeek response must be a JSON object or item array, got {type(value).__name__}")
     return value
