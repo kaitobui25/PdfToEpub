@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
+import math
 import re
 from typing import Any
 
@@ -192,7 +193,7 @@ def _sentence_tokens(text: str) -> list[str]:
 
 
 def _sentence_change_records(current: str, proposed: str) -> tuple[list[dict[str, Any]], str | None, int]:
-    """Describe lexical replacement spans; reject insert/delete/reordering/punctuation edits."""
+    """Describe lexical replacement spans; reject bare insert/delete/reordering/punctuation edits."""
 
     before = _sentence_tokens(current)
     after = _sentence_tokens(proposed)
@@ -224,6 +225,23 @@ def _sentence_change_records(current: str, proposed: str) -> tuple[list[dict[str
     return records, None, changed_words
 
 
+def _whole_sentence_votes(item: DeepQueueItem, proposed: str) -> int:
+    """Count OCR alternatives that directly contain the complete proposed sentence."""
+
+    return sum(1 for candidate in item.candidates if _candidate_contains_sequence(candidate, proposed))
+
+
+def _changed_word_count(current: str, proposed: str) -> int:
+    before = _normalized_words(current)
+    after = _normalized_words(proposed)
+    matcher = SequenceMatcher(a=before, b=after, autojunk=False)
+    return sum(
+        max(i2 - i1, j2 - j1)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes()
+        if tag != "equal"
+    )
+
+
 def apply_ai_sentence(
     item: DeepQueueItem,
     ai_raw: dict[str, Any],
@@ -232,10 +250,10 @@ def apply_ai_sentence(
 ) -> tuple[str, list[dict[str, Any]]]:
     """Validate a complete proposed sentence and apply it only as one atomic unit.
 
-    Deep may repair several related OCR tokens in one sentence. Local code diffs
-    the proposal into short lexical spans, validates every span against OCR
-    alternatives/glyph shape, and writes the proposed sentence only if every
-    changed span passes. This prevents half-corrections such as ``bắt đâu``.
+    Normal corrections are checked span-by-span. A structural sentence change is
+    still allowed when Deep is >=0.98 confident AND an independent OCR alternative
+    directly contains the complete proposed sentence. This rescues strongly
+    supported OCR reconstructions without opening the gate to free-form rewriting.
     """
 
     proposed_value = ai_raw.get("corrected_sentence") if isinstance(ai_raw, dict) else None
@@ -273,13 +291,41 @@ def apply_ai_sentence(
         ]
 
     changes, structural_error, changed_words = _sentence_change_records(current, proposed)
+    total_words = len(_normalized_words(current))
     if structural_error:
+        whole_votes = _whole_sentence_votes(item, proposed)
+        whole_changed_words = _changed_word_count(current, proposed)
+        required = max(0.98, min_confidence)
+        max_whole_change = max(max_changed_words + 2, math.ceil(total_words * 0.75))
+        if whole_votes and confidence >= required and whole_changed_words <= max_whole_change:
+            return proposed, [
+                {
+                    "kind": "sentence",
+                    "old": current,
+                    "new": proposed,
+                    "confidence": confidence,
+                    "changed_words": whole_changed_words,
+                    "evidence": {
+                        "whole_sentence_votes": whole_votes,
+                        "candidate_count": len(item.candidates),
+                    },
+                    "required_confidence": required,
+                    "gate": "sentence_whole_ocr_candidate",
+                    "applied": True,
+                }
+            ]
         return item.current, [
             {
                 "kind": "sentence",
                 "old": current,
                 "new": proposed,
                 "confidence": confidence,
+                "changed_words": whole_changed_words,
+                "evidence": {
+                    "whole_sentence_votes": whole_votes,
+                    "candidate_count": len(item.candidates),
+                },
+                "required_confidence": required if whole_votes else None,
                 "gate": structural_error,
                 "applied": False,
             }
@@ -287,8 +333,27 @@ def apply_ai_sentence(
     if not changes:
         return item.current, []
 
-    total_words = sum(1 for token in _sentence_tokens(current) if WORD_TOKEN_RE.fullmatch(token))
     if changed_words > max_changed_words or (total_words >= 10 and changed_words / max(1, total_words) > 0.40):
+        whole_votes = _whole_sentence_votes(item, proposed)
+        required = max(0.98, min_confidence)
+        max_whole_change = max(max_changed_words + 2, math.ceil(total_words * 0.75))
+        if whole_votes and confidence >= required and changed_words <= max_whole_change:
+            return proposed, [
+                {
+                    "kind": "sentence",
+                    "old": current,
+                    "new": proposed,
+                    "confidence": confidence,
+                    "changed_words": changed_words,
+                    "evidence": {
+                        "whole_sentence_votes": whole_votes,
+                        "candidate_count": len(item.candidates),
+                    },
+                    "required_confidence": required,
+                    "gate": "sentence_whole_ocr_candidate",
+                    "applied": True,
+                }
+            ]
         return item.current, [
             {
                 "kind": "sentence",
