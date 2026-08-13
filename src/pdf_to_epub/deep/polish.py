@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import re
+import threading
 import time
 from typing import Any, Callable
 
@@ -16,6 +19,9 @@ from .client import deepseek_call, find_opencode, run_exe
 from .gate import apply_ai_ops
 from .prompt import build_prompt
 from .queue import build_queue
+
+
+LOCK_RETRY_DELAYS = (0.75, 1.5, 3.0, 6.0)
 
 
 @dataclass(slots=True)
@@ -46,6 +52,13 @@ def _patch_exact_lines(text: str, replacements: dict[str, str]) -> tuple[str, in
         output = output.replace(old, new, 1)
         patched += 1
     return output, patched, missed
+
+
+def _worker_database(root: Path) -> Path:
+    """Return one private OpenCode SQLite DB per executor worker for this run."""
+
+    worker = re.sub(r"[^A-Za-z0-9_.-]+", "_", threading.current_thread().name)
+    return root / f"run_{os.getpid()}_{worker}.db"
 
 
 def run_deep_only(
@@ -79,31 +92,55 @@ def run_deep_only(
 
     ai_by_id: dict[str, dict[str, Any]] = {}
     failed_calls = 0
+    lock_retries = 0
     call_seconds: list[float] = []
     ai_start = time.perf_counter()
+    worker_db_root = layout.deep_work_dir / "opencode_worker_db"
+    worker_db_root.mkdir(parents=True, exist_ok=True)
 
-    def call(index: int, batch: list[DeepQueueItem]) -> tuple[int, list[DeepQueueItem], dict[str, Any], float]:
+    def call(
+        index: int,
+        batch: list[DeepQueueItem],
+    ) -> tuple[int, list[DeepQueueItem], dict[str, Any], float, int]:
         t0 = time.perf_counter()
-        result = deepseek_call(
-            opencode,
-            config.model,
-            build_prompt(batch),
-            layout.deep_work_dir,
-            f"deep_micro_{index:03d}",
-            config.call_timeout_seconds,
-        )
-        return index, batch, result, time.perf_counter() - t0
+        retries = 0
+        database_path = _worker_database(worker_db_root)
+        while True:
+            try:
+                result = deepseek_call(
+                    opencode,
+                    config.model,
+                    build_prompt(batch),
+                    layout.deep_work_dir,
+                    f"deep_micro_{index:03d}",
+                    config.call_timeout_seconds,
+                    database_path=database_path,
+                )
+                return index, batch, result, time.perf_counter() - t0, retries
+            except RuntimeError as exc:
+                locked = "database is locked" in str(exc).casefold()
+                if not locked or retries >= len(LOCK_RETRY_DELAYS):
+                    raise
+                delay = LOCK_RETRY_DELAYS[retries]
+                retries += 1
+                log(
+                    f"[AI RETRY {index:03d}] OpenCode DB locked; "
+                    f"retry {retries}/{len(LOCK_RETRY_DELAYS)} in {delay:.2f}s"
+                )
+                time.sleep(delay)
 
-    with ThreadPoolExecutor(max_workers=config.workers) as pool:
+    with ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="deep_ai") as pool:
         futures = [pool.submit(call, i + 1, batch) for i, batch in enumerate(batches)]
         for future in as_completed(futures):
             try:
-                index, batch, response, elapsed = future.result()
+                index, batch, response, elapsed, retries = future.result()
+                lock_retries += retries
                 call_seconds.append(elapsed)
                 for row in response.get("items", []):
                     if isinstance(row, dict) and row.get("id"):
                         ai_by_id[str(row["id"])] = row
-                log(f"[AI {index:03d}/{len(batches):03d}] items={len(batch)} time={elapsed:.2f}s")
+                retry_suffix = f" retries={retries}" if retries else ""
+                log(f"[AI {index:03d}/{len(batches):03d}] items={len(batch)} time={elapsed:.2f}s{retry_suffix}")
             except Exception as exc:  # keep remaining independent batches running
                 failed_calls += 1
                 log(f"[AI FAIL] {exc}")
@@ -154,6 +191,7 @@ def run_deep_only(
         "ai_workers": config.workers,
         "ai_calls": len(batches),
         "ai_failed_calls": failed_calls,
+        "ai_database_lock_retries": lock_retries,
         "ai_wall_seconds": round(ai_wall, 3),
         "ai_sum_call_seconds": round(sum(call_seconds), 3),
         "applied_lines": applied_lines,
