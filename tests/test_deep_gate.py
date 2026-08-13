@@ -15,62 +15,77 @@ def item(current: str, candidates: list[str]) -> DeepQueueItem:
     )
 
 
-def test_candidate_supported_high_confidence_is_applied() -> None:
-    source = item("Giữ cho nó đơn giân", ["Giữ cho nó đơn giản", "Giữ cho nó đơn giản"])
-    corrected, audit = apply_ai_ops(source, [{"old": "giân", "new": "giản", "confidence": 0.99}], 0.97)
-    assert corrected == "Giữ cho nó đơn giản"
-    assert audit[0]["gate"] == "candidate"
+def test_one_ocr_vote_lowers_threshold_to_095() -> None:
+    source = item("thói quen đứt khoát", ["thói quen dứt khoát"])
+    corrected, audit = apply_ai_ops(source, [{"old": "đứt", "new": "dứt", "confidence": 0.95}], 0.97)
+    assert corrected == "thói quen dứt khoát"
+    assert audit[0]["gate"] == "ocr_evidence"
+    assert audit[0]["required_confidence"] <= 0.95
+
+
+def test_two_ocr_votes_allow_stronger_evidence_discount() -> None:
+    source = item("ông ta uà chờ", ["ông ta và chờ", "ông ta và chờ"])
+    corrected, audit = apply_ai_ops(source, [{"old": "uà", "new": "và", "confidence": 0.93}], 0.97)
+    assert corrected == "ông ta và chờ"
     assert audit[0]["applied"] is True
 
 
-def test_low_confidence_is_rejected() -> None:
-    source = item("thói quen đứt khoát", ["thói quen dứt khoát"])
-    corrected, audit = apply_ai_ops(source, [{"old": "đứt", "new": "dứt", "confidence": 0.95}], 0.97)
-    assert corrected == source.current
-    assert audit[0]["gate"] == "low_confidence"
-
-
-def test_diacritic_only_can_apply_without_candidate() -> None:
-    source = item("khán giả dé hiểu", [])
-    corrected, audit = apply_ai_ops(source, [{"old": "dé", "new": "dễ", "confidence": 0.99}], 0.97)
-    assert corrected == "khán giả dễ hiểu"
-    assert audit[0]["gate"] == "diacritic_only"
-
-
-def test_exact_substring_uniqueness_preserves_baseline_behavior() -> None:
-    source = item("người kế chuyện tự do kết nối", ["người kể chuyện tự do kết nối"])
-    corrected, audit = apply_ai_ops(source, [{"old": "kế", "new": "kể", "confidence": 0.99}], 0.97)
-    # `kế` occurs once as a word and again inside `kết`; current baseline blocks it.
-    assert corrected == source.current
-    assert audit[0]["gate"] == "old_not_unique_in_current"
-
-
-def test_candidate_matching_ignores_attached_punctuation() -> None:
-    source = item("DeWitt WWallace,", ["DeWitt Wallace,"])
-    corrected, audit = apply_ai_ops(source, [{"old": "WWallace", "new": "Wallace", "confidence": 0.97}], 0.97)
-    assert corrected == "DeWitt Wallace,"
-    assert audit[0]["gate"] == "candidate"
-
-
-def test_strong_ocr_majority_vetoes_ai_even_with_one_new_vote() -> None:
-    source = item(
-        "anh bạn tré",
-        ["anh bạn tré", "anh bạn tré", "anh bạn tré", "anh bạn tré", "anh bạn trẻ"],
-    )
-    corrected, audit = apply_ai_ops(source, [{"old": "tré", "new": "trẻ", "confidence": 0.98}], 0.97)
-    assert corrected == source.current
-    assert audit[0]["gate"] == "ocr_evidence_strongly_prefers_current"
-
-
-def test_one_glyph_candidate_change_is_rejected_when_shape_is_unrelated() -> None:
-    source = item("thấy 6 ngoài", ["thấy ở ngoài", "thấy ở ngoài", "thấy 6 ngoài"])
+def test_single_glyph_change_is_allowed_when_ai_and_ocr_agree() -> None:
+    source = item("sáng tạo để thấy 6 ngoài kia", ["sáng tạo để thấy ở ngoài kia"])
     corrected, audit = apply_ai_ops(source, [{"old": "6", "new": "ở", "confidence": 0.98}], 0.97)
-    assert corrected == source.current
-    assert audit[0]["gate"] == "candidate_change_too_large"
+    assert corrected == "sáng tạo để thấy ở ngoài kia"
+    assert audit[0]["gate"] == "ocr_evidence"
 
 
-def test_weak_diacritic_guess_at_threshold_is_held_for_review() -> None:
-    source = item("động lực đế thực hiện", ["động lực đế thực hiện", "động lực dé thực hiện"])
-    corrected, audit = apply_ai_ops(source, [{"old": "đế", "new": "để", "confidence": 0.97}], 0.97)
+def test_unsupported_non_shape_rewrite_is_rejected_even_at_099() -> None:
+    source = item("một câu bình thường", [])
+    corrected, audit = apply_ai_ops(source, [{"old": "bình", "new": "hoàn", "confidence": 0.99}], 0.97)
     assert corrected == source.current
-    assert audit[0]["gate"] == "diacritic_guess_without_visual_or_phrase_gain"
+    assert audit[0]["gate"] == "unsupported_new"
+
+
+def test_shape_preserving_diacritic_without_candidate_requires_098() -> None:
+    source = item("khán giả dé hiểu", [])
+    corrected, audit = apply_ai_ops(source, [{"old": "dé", "new": "dễ", "confidence": 0.98}], 0.97)
+    assert corrected == "khán giả dễ hiểu"
+    assert audit[0]["gate"] == "shape_preserving"
+
+
+def test_token_boundary_does_not_confuse_ke_with_ket() -> None:
+    source = item("người kế chuyện tự do kết nối", ["người kể chuyện tự do kết nối"])
+    corrected, audit = apply_ai_ops(source, [{"old": "kế", "new": "kể", "confidence": 0.98}], 0.97)
+    assert corrected == "người kể chuyện tự do kết nối"
+    assert audit[0]["applied"] is True
+
+
+def test_segmentation_can_use_shape_preservation_without_candidate() -> None:
+    source = item("4. Vidu về thói quen", [])
+    corrected, audit = apply_ai_ops(
+        source,
+        [{"kind": "segment", "old": "Vidu", "new": "Ví dụ", "confidence": 0.99}],
+        0.97,
+    )
+    assert corrected == "4. Ví dụ về thói quen"
+    assert audit[0]["gate"] == "segmentation_shape"
+
+
+def test_segmentation_with_ocr_candidate_can_apply_at_095() -> None:
+    source = item("4. Vidu về thói quen", ["4. Ví dụ về thói quen"])
+    corrected, audit = apply_ai_ops(
+        source,
+        [{"kind": "segment", "old": "Vidu", "new": "Ví dụ", "confidence": 0.95}],
+        0.97,
+    )
+    assert corrected == "4. Ví dụ về thói quen"
+    assert audit[0]["gate"] == "segmentation_evidence"
+
+
+def test_unrelated_segmentation_is_rejected() -> None:
+    source = item("một abc ví dụ", [])
+    corrected, audit = apply_ai_ops(
+        source,
+        [{"kind": "segment", "old": "abc", "new": "hai chữ", "confidence": 0.99}],
+        0.97,
+    )
+    assert corrected == source.current
+    assert audit[0]["gate"] == "segmentation_without_visual_or_shape_support"

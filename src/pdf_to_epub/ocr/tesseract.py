@@ -1,4 +1,4 @@
-"""Tesseract integration and OCR evidence extraction."""
+"""Tesseract integration and OCR evidence definitions."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from pathlib import Path
 import shutil
 from typing import Iterable
 
-import cv2
 import numpy as np
 import pytesseract
 from pytesseract import Output
@@ -26,13 +25,22 @@ class WholePass:
     transform: str
 
 
-# Five evidence passes observed in the tested FIX3 LOCAL_TURBO run.
+# Fast evidence set used for every logical side.
 WHOLE_PASSES: tuple[WholePass, ...] = (
     WholePass("base_ve_25", "vie+eng", 4, 2.5, "gray"),
     WholePass("sharp_ve_25", "vie+eng", 4, 2.5, "sharp"),
     WholePass("base_v_25", "vie", 4, 2.5, "gray"),
     WholePass("base_v_30", "vie", 4, 3.0, "gray"),
     WholePass("base_v_30_p3", "vie", 3, 3.0, "gray"),
+)
+
+# Expensive whole-side rescue set. It runs only after health.py classifies a
+# side as catastrophic, so normal pages keep the previous fast path.
+FALLBACK_PASSES: tuple[WholePass, ...] = (
+    WholePass("fallback_otsu_v_35_p6", "vie", 6, 3.5, "otsu"),
+    WholePass("fallback_adaptive_v_35_p6", "vie", 6, 3.5, "adaptive"),
+    WholePass("fallback_sharp_ve_35_p6", "vie+eng", 6, 3.5, "sharp"),
+    WholePass("fallback_base_v_40_p11", "vie", 11, 4.0, "gray"),
 )
 
 LINE_PASSES: tuple[WholePass, ...] = (
@@ -45,8 +53,6 @@ LINE_PASSES: tuple[WholePass, ...] = (
 
 
 def configure_tesseract(explicit: str | None = None) -> str:
-    """Resolve Tesseract on Windows/Linux and configure pytesseract."""
-
     candidates = [
         explicit,
         os.environ.get("TESSERACT_CMD"),
@@ -68,27 +74,26 @@ def require_languages() -> None:
         raise RuntimeError(f"Tesseract is missing languages: {', '.join(sorted(missing))}")
 
 
-def _transform(image: np.ndarray, spec: WholePass) -> np.ndarray:
-    fn = {
+def prepare_image(image: np.ndarray, spec: WholePass) -> np.ndarray:
+    """Apply one OCR pass's visual transform and scale in one canonical place."""
+
+    transform = {
         "gray": preprocess.gray,
         "sharp": preprocess.sharpen,
         "otsu": preprocess.otsu,
         "adaptive": preprocess.adaptive,
     }[spec.transform]
-    return preprocess.resize(fn(image), spec.scale)
+    return preprocess.resize(transform(image), spec.scale)
 
 
 def _clean_conf(value: object) -> float:
     try:
-        result = float(value)
+        return float(value)
     except (TypeError, ValueError):
         return -1.0
-    return result
 
 
 def _line_rows(data: dict[str, list[object]]) -> list[tuple[str, float, tuple[int, int, int, int]]]:
-    """Group pytesseract word rows into visual lines while preserving geometry."""
-
     grouped: dict[tuple[int, int, int], list[int]] = {}
     count = len(data.get("text", []))
     for i in range(count):
@@ -114,11 +119,10 @@ def _line_rows(data: dict[str, list[object]]) -> list[tuple[str, float, tuple[in
 
 
 def ocr_whole_pass(image: np.ndarray, spec: WholePass) -> list[tuple[str, float, tuple[int, int, int, int]]]:
-    transformed = _transform(image, spec)
+    transformed = prepare_image(image, spec)
     config = f"--oem 1 --psm {spec.psm} -c preserve_interword_spaces=1"
     data = pytesseract.image_to_data(transformed, lang=spec.language, config=config, output_type=Output.DICT)
     rows = _line_rows(data)
-    # Return geometry in original side-image coordinates.
     return [
         (text, conf, (int(x / spec.scale), int(y / spec.scale), int(w / spec.scale), int(h / spec.scale)))
         for text, conf, (x, y, w, h) in rows
@@ -126,7 +130,7 @@ def ocr_whole_pass(image: np.ndarray, spec: WholePass) -> list[tuple[str, float,
 
 
 def ocr_line_crop(image: np.ndarray, spec: WholePass) -> OCRCandidate:
-    transformed = _transform(image, spec)
+    transformed = prepare_image(image, spec)
     config = f"--oem 1 --psm {spec.psm} -c preserve_interword_spaces=1"
     data = pytesseract.image_to_data(transformed, lang=spec.language, config=config, output_type=Output.DICT)
     words = [str(t).strip() for t in data["text"] if str(t).strip()]
@@ -143,8 +147,6 @@ def ocr_line_crop(image: np.ndarray, spec: WholePass) -> OCRCandidate:
 
 
 def crop_line(image: np.ndarray, line: OCRLine) -> np.ndarray:
-    """Crop source pixels around one line using the tested asymmetric padding."""
-
     height, width = image.shape[:2]
     pad_x = max(25, int(width * 0.06))
     pad_y = max(22, int(height * 0.025))

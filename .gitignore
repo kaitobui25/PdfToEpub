@@ -20,6 +20,7 @@ SUMMARY_*.json
 cleanup_audit.json
 local_review.json
 local_refine_audit.json
+whole_side_health.json
 deep_ai_queue.json
 deep_ai_audit.json
 

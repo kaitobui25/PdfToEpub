@@ -1,4 +1,4 @@
-"""OCR quality heuristics shared by whole-side selection and local refinement."""
+"""OCR quality helpers shared by local refinement, side health and Deep gate."""
 
 from __future__ import annotations
 
@@ -23,6 +23,17 @@ def normalize_token(token: str) -> str:
     return token.strip(".,;:!?…'\"“”‘’()[]{}<>+-–—/*").casefold()
 
 
+def shape_key(text: str) -> str:
+    """Return OCR glyph shape while ignoring spaces, punctuation and diacritics.
+
+    This is useful for safe word segmentation: ``Vidu`` and ``Ví dụ`` share the
+    same shape key even though one OCR token should become two language tokens.
+    """
+
+    words = WORD_RE.findall(strip_diacritics(text).casefold())
+    return "".join(words)
+
+
 def garbage_score(text: str) -> float:
     """Return a small penalty for symbol soup and obvious OCR corruption."""
 
@@ -32,6 +43,13 @@ def garbage_score(text: str) -> float:
     compact_runs = len(re.findall(r"\S{24,}", text))
     control = sum(1 for ch in text if unicodedata.category(ch).startswith("C") and ch not in "\n\t")
     return weird * 2.0 + compact_runs * 6.0 + control * 10.0
+
+
+def garbage_ratio(text: str) -> float:
+    """Normalized unsupported-glyph ratio used by whole-side health checks."""
+
+    visible = sum(1 for char in text if not char.isspace())
+    return len(GARBAGE_RE.findall(text)) / max(1, visible)
 
 
 def side_score(lines: Iterable[tuple[str, float, tuple[int, int, int, int]]]) -> float:
@@ -51,11 +69,7 @@ def diacritic_only(old: str, new: str) -> bool:
 
 
 def candidate_votes(current: str, candidates: Iterable[OCRCandidate]) -> Counter[str]:
-    """Count alternate pass token spellings aligned by diacritic-insensitive shape.
-
-    This is intentionally conservative: it only creates votes when a candidate
-    has the same token count and the same diacritic-free token skeleton.
-    """
+    """Count alternate pass token spellings aligned by diacritic-insensitive shape."""
 
     current_tokens = current.split()
     votes: Counter[str] = Counter()

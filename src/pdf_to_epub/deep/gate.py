@@ -1,91 +1,115 @@
-"""Safety gate for DeepSeek token corrections.
+"""Evidence-aware safety gate for DeepSeek OCR corrections.
 
-The validator is deliberately conservative. DeepSeek may *suggest* a repair,
-but this module owns the final decision about whether that suggestion is safe
-to write into the book text.
-
-This file preserves the pre-fix V4 baseline behaviour. Keeping all acceptance
-policy here makes later gate tuning isolated from OCR, OpenCode transport and
-EPUB generation.
+DeepSeek proposes edits; this module decides whether independent OCR evidence is
+strong enough to apply them. Confidence is therefore not a global on/off switch:
+a lower-confidence suggestion can pass when OCR alternatives agree, while an
+unsupported rewrite remains blocked even at high confidence.
 """
 
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
+import re
 from typing import Any
 
 from ..models import DeepQueueItem
-from ..ocr.scoring import diacritic_only, normalize_token
+from ..ocr.scoring import diacritic_only, normalize_token, shape_key
 
 
-def _candidate_contains_token(candidate: str, token: str) -> bool:
-    """Return whether *candidate* contains *token* as an OCR word.
+@dataclass(frozen=True, slots=True)
+class EvidenceProfile:
+    old_votes: int
+    new_votes: int
+    candidate_count: int
+    shape_preserving: bool
+    segmented: bool
 
-    OCR lines commonly attach punctuation/quotes to a word (``Wallace,``,
-    ``“bị”``, ``nhé!``). Comparing raw ``str.split()`` tokens would miss that
-    visual evidence, so both sides are normalized before comparison.
-    """
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
 
-    wanted = normalize_token(token)
-    if not wanted:
+
+def _normalized_words(text: str) -> list[str]:
+    return [normalize_token(part) for part in text.split() if normalize_token(part)]
+
+
+def _candidate_contains_sequence(candidate: str, value: str) -> bool:
+    """Match one token or a short segmented phrase inside an OCR alternative."""
+
+    candidate_words = _normalized_words(candidate)
+    wanted = _normalized_words(value)
+    if not wanted or len(wanted) > len(candidate_words):
         return False
-    return any(normalize_token(part) == wanted for part in candidate.split())
+    width = len(wanted)
+    return any(candidate_words[index : index + width] == wanted for index in range(len(candidate_words) - width + 1))
 
 
-def _ocr_votes(item: DeepQueueItem, old: str, new: str) -> tuple[int, int]:
-    """Count alternate line OCR candidates that support OLD and NEW."""
-
-    old_votes = sum(1 for candidate in item.candidates if _candidate_contains_token(candidate, old))
-    new_votes = sum(1 for candidate in item.candidates if _candidate_contains_token(candidate, new))
-    return old_votes, new_votes
-
-
-def _evidence_strongly_prefers_current(old: str, old_votes: int, new_votes: int) -> bool:
-    """Protect text when repeated OCR evidence overwhelmingly supports OLD.
-
-    Four agreeing candidate passes versus at most one NEW vote is considered a
-    hard visual veto. A one-character OLD token gets the same protection at
-    three votes because accidental insertion/deletion around tiny OCR fragments
-    is especially risky.
-    """
-
-    if new_votes > 1:
-        return False
-    old_core = normalize_token(old)
-    return old_votes >= 4 or (len(old_core) == 1 and old_votes >= 3)
-
-
-def _candidate_change_too_large(old: str, new: str) -> bool:
-    """Reject unsupported-looking one-glyph substitutions.
-
-    A candidate pass alone is not enough evidence to turn one unrelated glyph
-    into another (for example a digit into a Vietnamese letter). Diacritic-only
-    changes are exempt because they preserve the same base glyph.
-    """
-
-    old_core = normalize_token(old)
-    new_core = normalize_token(new)
-    return (
-        len(old_core) == 1
-        and len(new_core) == 1
-        and not diacritic_only(old_core, new_core)
-        and old_core.casefold() != new_core.casefold()
+def _evidence(item: DeepQueueItem, old: str, new: str) -> EvidenceProfile:
+    old_votes = sum(1 for candidate in item.candidates if _candidate_contains_sequence(candidate, old))
+    new_votes = sum(1 for candidate in item.candidates if _candidate_contains_sequence(candidate, new))
+    segmented = len(new.split()) > 1
+    return EvidenceProfile(
+        old_votes=old_votes,
+        new_votes=new_votes,
+        candidate_count=len(item.candidates),
+        shape_preserving=bool(shape_key(old)) and shape_key(old) == shape_key(new),
+        segmented=segmented,
     )
 
 
-def _weak_diacritic_guess(
-    *, confidence: float, old_votes: int, candidate_count: int, new_votes: int
-) -> bool:
-    """Identify the baseline's weakest unsupported accent-only suggestions.
+def _token_matches(text: str, token: str) -> list[re.Match[str]]:
+    """Find exact OCR-token occurrences without matching inside another word."""
 
-    At the minimum accepted AI confidence (0.97), a correction with no visual
-    NEW vote is withheld when at least half of the available OCR candidates
-    still contain OLD. This intentionally keeps the old conservative policy;
-    later quality work can tune this rule without touching other stages.
+    pattern = re.compile(rf"(?<!\w){re.escape(token)}(?!\w)", re.UNICODE)
+    return list(pattern.finditer(text))
+
+
+def _replace_unique_token(text: str, old: str, new: str) -> tuple[str, int]:
+    matches = _token_matches(text, old)
+    if len(matches) != 1:
+        return text, len(matches)
+    match = matches[0]
+    return text[: match.start()] + new + text[match.end() :], 1
+
+
+def _operation_kind(raw: dict[str, Any], new: str) -> str:
+    declared = str(raw.get("kind") or "").strip().casefold()
+    if declared in {"replace", "segment"}:
+        return declared
+    return "segment" if any(char.isspace() for char in new) else "replace"
+
+
+def _valid_segment(old: str, new: str) -> bool:
+    """Allow one fused OCR token to become two/three real words, never a rewrite."""
+
+    if any(char.isspace() for char in old):
+        return False
+    parts = new.split()
+    return 2 <= len(parts) <= 3 and all(normalize_token(part) for part in parts)
+
+
+def _required_confidence(base: float, evidence: EvidenceProfile) -> float | None:
+    """Convert independent visual support into a dynamic confidence threshold.
+
+    With the default base=0.97:
+      - 2+ OCR alternatives supporting NEW: threshold 0.92
+      - 1 OCR alternative supporting NEW: threshold 0.95
+      - shape-preserving candidate support (diacritics/segmentation): up to 0.02 lower
+      - no visual NEW support: only shape-preserving edits at >=0.98
     """
 
-    if confidence > 0.97 or new_votes:
-        return False
-    return candidate_count > 0 and old_votes * 2 >= candidate_count
+    if evidence.new_votes >= 2:
+        threshold = max(0.90, base - 0.05)
+        if evidence.shape_preserving:
+            threshold = max(0.90, threshold - 0.02)
+        return threshold
+    if evidence.new_votes == 1:
+        threshold = max(0.92, base - 0.02)
+        if evidence.shape_preserving:
+            threshold = max(0.90, threshold - 0.02)
+        return threshold
+    if evidence.shape_preserving:
+        return max(base, 0.98)
+    return None
 
 
 def apply_ai_ops(
@@ -94,12 +118,7 @@ def apply_ai_ops(
     min_confidence: float,
     max_ops: int = 3,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Apply exact, one-token, high-confidence OCR repairs.
-
-    Every model suggestion receives a stable ``gate`` label in the returned
-    audit. The order of checks is intentional: hard safety constraints run
-    before visual support and language-level diacritic fallbacks.
-    """
+    """Apply only token-local repairs supported by OCR evidence or glyph shape."""
 
     current = item.current
     audited: list[dict[str, Any]] = []
@@ -107,12 +126,14 @@ def apply_ai_ops(
     for raw in ai_ops[:max_ops]:
         old = str(raw.get("old") or "")
         new = str(raw.get("new") or "")
+        kind = _operation_kind(raw, new)
         try:
             confidence = float(raw.get("confidence") or 0.0)
         except (TypeError, ValueError):
             confidence = 0.0
 
         record: dict[str, Any] = {
+            "kind": kind,
             "old": old,
             "new": new,
             "confidence": confidence,
@@ -122,44 +143,47 @@ def apply_ai_ops(
 
         if not old or not new:
             record["gate"] = "empty_token"
-        elif any(ch.isspace() for ch in old) or any(ch.isspace() for ch in new):
-            record["gate"] = "multi_token"
+        elif any(char.isspace() for char in old):
+            record["gate"] = "old_must_be_one_token"
         elif old == new:
             record["gate"] = "same_value"
-        elif confidence < min_confidence:
-            record["gate"] = "low_confidence"
-        elif current.count(old) != 1:
-            # Exact substring uniqueness prevents replacing the wrong occurrence.
-            record["gate"] = "old_not_unique_in_current"
+        elif kind == "replace" and any(char.isspace() for char in new):
+            record["gate"] = "replace_new_must_be_one_token"
+        elif kind == "segment" and not _valid_segment(old, new):
+            record["gate"] = "invalid_segmentation"
         else:
-            old_votes, new_votes = _ocr_votes(item, old, new)
-            candidate_supported = new_votes > 0
-            accent_only = diacritic_only(old, new)
-
-            if _evidence_strongly_prefers_current(old, old_votes, new_votes):
-                record["gate"] = "ocr_evidence_strongly_prefers_current"
-            elif candidate_supported and _candidate_change_too_large(old, new):
-                record["gate"] = "candidate_change_too_large"
-            elif candidate_supported:
-                record["gate"] = "candidate"
-                record["applied"] = True
-            elif accent_only and _weak_diacritic_guess(
-                confidence=confidence,
-                old_votes=old_votes,
-                candidate_count=len(item.candidates),
-                new_votes=new_votes,
-            ):
-                record["gate"] = "diacritic_guess_without_visual_or_phrase_gain"
-            elif accent_only:
-                record["gate"] = "diacritic_only"
-                record["applied"] = True
+            _, occurrences = _replace_unique_token(current, old, new)
+            if occurrences != 1:
+                record["gate"] = "old_not_unique_token_in_current"
             else:
-                # The strict model prompt normally avoids reaching this branch,
-                # but retaining it makes malformed/unsupported suggestions safe.
-                record["gate"] = "unsupported_new"
+                evidence = _evidence(item, old, new)
+                required = _required_confidence(min_confidence, evidence)
+                record["evidence"] = evidence.as_dict()
+                record["required_confidence"] = required
 
-        if record["applied"]:
-            current = current.replace(old, new, 1)
+                if kind == "segment" and not (evidence.new_votes or evidence.shape_preserving):
+                    record["gate"] = "segmentation_without_visual_or_shape_support"
+                elif required is None:
+                    record["gate"] = "unsupported_new"
+                elif confidence < required:
+                    record["gate"] = "insufficient_confidence_for_evidence"
+                else:
+                    corrected, occurrences = _replace_unique_token(current, old, new)
+                    if occurrences != 1:
+                        record["gate"] = "old_not_unique_token_in_current"
+                    else:
+                        current = corrected
+                        record["gate"] = (
+                            "segmentation_evidence"
+                            if kind == "segment" and evidence.new_votes
+                            else "segmentation_shape"
+                            if kind == "segment"
+                            else "ocr_evidence"
+                            if evidence.new_votes
+                            else "shape_preserving"
+                        )
+                        record["applied"] = True
+
         audited.append(record)
 
     return current, audited
