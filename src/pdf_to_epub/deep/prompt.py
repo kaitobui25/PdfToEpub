@@ -27,7 +27,7 @@ SAFETY RULES:
 4. A segment operation without an exact matching alternative is allowed only
    when removing spaces/diacritics makes OLD and NEW the same glyph sequence.
 5. Do not delete text, insert unrelated words, reorder, or rewrite a sentence.
-6. Maximum 3 operations per item.
+6. Maximum 5 token-local operations per item.
 7. confidence is advisory only; do not inflate it to force an edit.
 
 Return JSON ONLY:
