@@ -78,6 +78,7 @@ class DeepQueueItem:
     context: str
     reasons: list[str]
     candidates: list[str]
+    source_ids: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -88,4 +89,5 @@ class DeepQueueItem:
             "context": self.context,
             "reasons": self.reasons,
             "candidates": self.candidates,
+            "source_ids": self.source_ids,
         }
