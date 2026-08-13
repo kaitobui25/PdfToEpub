@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local inputs / generated book content
+*.pdf
+*.epub
+*_LOCAL_TURBO.txt
+*_LOCAL_TURBO_DEEP.txt
+pdf_v4_local_turbo_*/
+_work/
+_deep_work/
+
+# Runtime audit/log artifacts
+*.log
+SUMMARY_*.json
+cleanup_audit.json
+local_review.json
+local_refine_audit.json
+deep_ai_queue.json
+deep_ai_audit.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

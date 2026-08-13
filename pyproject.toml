@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-to-epub-local-turbo"
+version = "0.4.0"
+description = "Vietnamese PDF to EPUB pipeline with local Tesseract OCR and optional DeepSeek validation."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "PyMuPDF>=1.24",
+  "numpy>=1.26",
+  "opencv-python>=4.10",
+  "Pillow>=10.4",
+  "pytesseract>=0.3.13",
+]
+
+[project.scripts]
+pdf-to-epub = "pdf_to_epub.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
