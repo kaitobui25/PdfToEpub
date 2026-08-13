@@ -218,6 +218,7 @@ def apply_ai_sentence(
     min_confidence: float,
     max_changed_words: int = 6,
     deep_trust: str = "strict",
+    ocr_evidence_gate: bool = True,
 ) -> tuple[str, list[dict[str, Any]]]:
     policy = _policy(deep_trust)
     proposed_value = ai_raw.get("corrected_sentence") if isinstance(ai_raw, dict) else None
@@ -234,6 +235,27 @@ def apply_ai_sentence(
         return item.current, []
     if not proposed:
         return item.current, [{"kind": "sentence", "old": current, "new": proposed, "confidence": confidence, "gate": "empty_sentence", "applied": False}]
+
+    if not ocr_evidence_gate:
+        if confidence < min_confidence:
+            return item.current, [{
+                "kind": "sentence",
+                "old": current,
+                "new": proposed,
+                "confidence": confidence,
+                "required_confidence": min_confidence,
+                "gate": "insufficient_deep_confidence",
+                "applied": False,
+            }]
+        return proposed, [{
+            "kind": "sentence",
+            "old": current,
+            "new": proposed,
+            "confidence": confidence,
+            "required_confidence": min_confidence,
+            "gate": "sentence_deep_direct",
+            "applied": True,
+        }]
 
     changes, structural_error, changed_words = _sentence_change_records(current, proposed)
     total_words = len(_normalized_words(current))
