@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 DEFAULT_MODEL = "opencode/deepseek-v4-flash-free"
+DEEP_TRUST_LEVELS = ("strict", "balanced", "high")
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,7 @@ class DeepConfig:
     batch_size: int = 6
     workers: int = 4
     min_apply_confidence: float = 0.97
+    deep_trust: str = "high"
     call_timeout_seconds: int = 120
     max_ops_per_item: int = 3
 
