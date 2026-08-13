@@ -78,13 +78,13 @@ class DeepQueueItem:
     context: str
     reasons: list[str]
     candidates: list[str]
-    # Full OCR source metadata is preserved for the local evidence gate. The
-    # simple text list above remains for backwards compatibility and compact
-    # prompts/old serialized queues.
+    # Full OCR source metadata is preserved for the local evidence gate.
     candidate_meta: list[dict[str, Any]] = field(default_factory=list)
+    # Local candidate generator constrains Deep to KEEP/C1/C2/... choices.
+    choice_sets: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
-        data = {
+        data: dict[str, Any] = {
             "id": self.item_id,
             "page": [self.page_number, self.side],
             "current": self.current,
@@ -95,4 +95,6 @@ class DeepQueueItem:
         }
         if self.candidate_meta:
             data["candidate_meta"] = self.candidate_meta
+        if self.choice_sets:
+            data["choice_sets"] = self.choice_sets
         return data
