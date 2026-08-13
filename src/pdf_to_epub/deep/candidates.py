@@ -1,31 +1,35 @@
 """Constrained local candidate generation for Vietnamese OCR repair.
 
-The language model is not allowed to invent replacement text.  This module
-builds a small choice list from evidence already available locally:
+Deep never invents replacement text.  Local code builds KEEP/C1/C2/... from:
 
-* aligned Tesseract alternatives,
-* words/phrases that already occur elsewhere in the same book/range,
-* Tesseract's Vietnamese lexicon when it is available,
-* conservative one-glyph neighbours for explicitly suspicious tokens.
-
-The model later chooses KEEP/C1/C2/... only.  Candidate strength is a local
-property and is deliberately independent of model self-reported confidence.
+* token-position-aligned Tesseract alternatives,
+* words/phrases recurring elsewhere in the same book/range,
+* Tesseract's Vietnamese lexicon when available,
+* a bounded Vietnamese diacritic-family fallback for rare one-vowel tokens,
+* conservative one-base-glyph neighbours for explicitly suspicious OCR.
 """
 
 from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from math import log1p
 import re
 from typing import Iterable
 
 from ..models import DeepQueueItem
 from ..ocr.scoring import normalize_token, shape_key, strip_diacritics
-from .evidence import summarize_evidence
 from .tokens import TokenRef, index_tokens
 
 MARKER_RE = re.compile(r"^===== PDF\d{3}-[LR] =====$")
+FAMILY_WEIGHTS = {"line_v": 1.00, "line_ve": 1.00, "whole_v": 0.72, "whole_ve": 0.72}
+DIACRITIC_VARIANTS = {
+    "a": "aàáảãạăằắẳẵặâầấẩẫậ",
+    "e": "eèéẻẽẹêềếểễệ",
+    "i": "iìíỉĩị",
+    "o": "oòóỏõọôồốổỗộơờớởỡợ",
+    "u": "uùúủũụưừứửữự",
+    "y": "yỳýỷỹỵ",
+}
 
 
 @dataclass(slots=True)
@@ -49,8 +53,8 @@ class BookStats:
         phrase = " ".join(words)
         if len(words) > 1 and self.phrases[phrase] > 0:
             return True
-        # A book token must recur before it is allowed to act as its own
-        # dictionary.  This prevents a one-off OCR error from validating itself.
+        # A one-off book token does not validate itself.  It must either belong
+        # to Tesseract's Vietnamese lexicon or recur in this book/range.
         return all(word in self.lexicon or self.unigrams[word] >= 2 for word in words)
 
 
@@ -69,8 +73,6 @@ def _match_case(old: str, value: str) -> str:
 
 
 def _base_edit_distance(left: str, right: str, limit: int = 1) -> int:
-    """Small Levenshtein distance after removing Vietnamese diacritics."""
-
     left = strip_diacritics(normalize_token(left)).casefold()
     right = strip_diacritics(normalize_token(right)).casefold()
     if left == right:
@@ -82,11 +84,7 @@ def _base_edit_distance(left: str, right: str, limit: int = 1) -> int:
         current = [i]
         row_min = i
         for j, b in enumerate(right, 1):
-            value = min(
-                current[j - 1] + 1,
-                previous[j] + 1,
-                previous[j - 1] + (a != b),
-            )
+            value = min(current[j - 1] + 1, previous[j] + 1, previous[j - 1] + (a != b))
             current.append(value)
             row_min = min(row_min, value)
         if row_min > limit:
@@ -98,7 +96,6 @@ def _base_edit_distance(left: str, right: str, limit: int = 1) -> int:
 def build_book_stats(text: str, lexicon: Iterable[str] = ()) -> BookStats:
     unigrams: Counter[str] = Counter()
     phrases: Counter[str] = Counter()
-
     for raw in text.splitlines():
         line = raw.strip()
         if not line or MARKER_RE.match(line):
@@ -122,17 +119,17 @@ def build_book_stats(text: str, lexicon: Iterable[str] = ()) -> BookStats:
         if key:
             phrase_shapes[key].add(phrase)
 
-    def word_order(value: str) -> tuple[int, str]:
-        return (-unigrams[value], value)
-
-    def phrase_order(value: str) -> tuple[int, str]:
-        return (-phrases[value], value)
-
     return BookStats(
         unigrams=unigrams,
         phrases=phrases,
-        shape_words={key: tuple(sorted(values, key=word_order)) for key, values in word_shapes.items()},
-        shape_phrases={key: tuple(sorted(values, key=phrase_order)) for key, values in phrase_shapes.items()},
+        shape_words={
+            key: tuple(sorted(values, key=lambda value: (-unigrams[value], value)))
+            for key, values in word_shapes.items()
+        },
+        shape_phrases={
+            key: tuple(sorted(values, key=lambda value: (-phrases[value], value)))
+            for key, values in phrase_shapes.items()
+        },
         lexicon=normalized_lexicon,
     )
 
@@ -150,6 +147,20 @@ def _non_dictionary_tokens(reasons: list[str]) -> set[str]:
     return result
 
 
+def _family(candidate: dict[str, object]) -> str:
+    kind = str(candidate.get("kind") or "whole").casefold()
+    source = str(candidate.get("source") or "").casefold()
+    is_ve = "_ve_" in source or source.startswith("line_ve") or source.startswith("fallback_ve")
+    return f"{'line' if kind == 'line' else 'whole'}_{'ve' if is_ve else 'v'}"
+
+
+def _confidence(candidate: dict[str, object]) -> float:
+    try:
+        return max(0.0, min(100.0, float(candidate.get("conf") or candidate.get("confidence") or 0.0))) / 100.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _aligned_alternatives(item: DeepQueueItem) -> dict[str, set[str]]:
     current = index_tokens(item.current)
     result: dict[str, set[str]] = defaultdict(set)
@@ -163,77 +174,153 @@ def _aligned_alternatives(item: DeepQueueItem) -> dict[str, set[str]]:
     return result
 
 
+def _aligned_visual_score(item: DeepQueueItem, token_id: str, new: str) -> float:
+    """Score NEW only at the target token position, never elsewhere in a line."""
+
+    current = index_tokens(item.current)
+    target_index = next((i for i, token in enumerate(current) if token.token_id == token_id), None)
+    if target_index is None or len(_words(new)) != 1:
+        return 0.0
+
+    wanted = normalize_token(new)
+    by_family: dict[str, float] = {}
+    for candidate in item.candidate_meta:
+        alternative = index_tokens(str(candidate.get("text") or ""))
+        if len(alternative) != len(current):
+            continue
+        if normalize_token(alternative[target_index].text) != wanted:
+            continue
+        family = _family(candidate)
+        by_family[family] = max(by_family.get(family, 0.0), _confidence(candidate))
+    return sum(FAMILY_WEIGHTS.get(family, 0.65) * conf for family, conf in by_family.items())
+
+
+def _single_vowel_diacritic_variants(old: str) -> set[str]:
+    """Enumerate only a one-vowel Vietnamese accent family.
+
+    This bounded fallback is useful when the installed Tesseract DAWG cannot be
+    decoded.  It cannot alter consonants or word length, and every resulting
+    candidate still needs two closed-choice votes unless stronger evidence exists.
+    """
+
+    core = normalize_token(old)
+    positions: list[tuple[int, str]] = []
+    for index, char in enumerate(core):
+        base = strip_diacritics(char).casefold()
+        if base in DIACRITIC_VARIANTS:
+            positions.append((index, base))
+    if len(positions) != 1:
+        return set()
+    index, base = positions[0]
+    result: set[str] = set()
+    for replacement in DIACRITIC_VARIANTS[base]:
+        value = core[:index] + replacement + core[index + 1 :]
+        if value != core:
+            result.add(_match_case(old, value))
+    return result
+
+
 def _candidate_strength(
     item: DeepQueueItem,
+    token_id: str,
     old: str,
     new: str,
     stats: BookStats,
     source_tags: set[str],
 ) -> tuple[str, dict[str, object]]:
-    evidence = summarize_evidence(item, old, new)
+    visual_score = _aligned_visual_score(item, token_id, new)
     new_frequency = stats.frequency(new)
     old_frequency = stats.frequency(old)
     lexical_valid = stats.lexical_valid(new)
+    domain_valid = lexical_valid or new_frequency > 0
+    old_non_dictionary = normalize_token(old) in _non_dictionary_tokens(item.reasons)
+    shape_preserving = bool(shape_key(old)) and shape_key(old) == shape_key(new)
+    segmented = len(_words(new)) > 1
     distance = _base_edit_distance(old, new, limit=1)
-    phrase_frequency = new_frequency if len(_words(new)) > 1 else 0
+    phrase_frequency = new_frequency if segmented else 0
 
-    # A non-dictionary replacement which is itself neither lexical nor observed
-    # elsewhere in the book is never trusted merely because several correlated
-    # OCR passes repeat it.  This is the Vidu -> Vidụ safety valve.
-    if evidence.old_non_dictionary and not lexical_valid and new_frequency == 0:
+    if old_non_dictionary and not domain_valid and "raw_diacritic_shape" not in source_tags:
         strength = "weak"
-    elif evidence.segmented and evidence.shape_preserving and phrase_frequency > 0 and lexical_valid:
+    elif segmented and shape_preserving and phrase_frequency > 0:
         strength = "strong"
-    elif evidence.new_score >= 1.60 and lexical_valid:
+    elif visual_score >= 1.60 and domain_valid:
         strength = "strong"
-    elif evidence.old_non_dictionary and evidence.new_score >= 0.80 and lexical_valid:
+    elif old_non_dictionary and visual_score >= 0.80 and domain_valid:
         strength = "strong"
     elif (
-        evidence.shape_preserving
-        and lexical_valid
+        shape_preserving
+        and domain_valid
         and new_frequency >= 3
         and new_frequency >= max(3, old_frequency * 2)
     ):
         strength = "strong"
-    elif lexical_valid and (
-        evidence.new_score > 0
-        or evidence.shape_preserving
+    elif "raw_diacritic_shape" in source_tags and shape_preserving:
+        strength = "medium"
+    elif domain_valid and (
+        visual_score > 0
+        or shape_preserving
         or "ocr_shape_expand" in source_tags
-        or (evidence.old_non_dictionary and distance <= 1)
+        or (old_non_dictionary and distance <= 1)
     ):
         strength = "medium"
-    elif new_frequency >= 2 and distance <= 1:
+    elif new_frequency >= 1 and distance <= 1:
         strength = "medium"
     else:
         strength = "weak"
 
-    metadata: dict[str, object] = {
+    return strength, {
         "strength": strength,
-        "visual_score": round(evidence.new_score, 4),
+        "visual_score": round(visual_score, 4),
         "book_frequency": new_frequency,
         "old_book_frequency": old_frequency,
         "lexical_valid": lexical_valid,
-        "shape_preserving": evidence.shape_preserving,
-        "segmented": evidence.segmented,
+        "shape_preserving": shape_preserving,
+        "segmented": segmented,
         "base_edit_distance": distance,
         "source_tags": sorted(source_tags),
     }
-    return strength, metadata
+
+
+def _source_priority(choice: dict[str, object]) -> int:
+    tags = set(choice.get("source_tags") or [])
+    if tags & {"book_phrase", "ocr_direct"}:
+        return 0
+    if "ocr_shape_expand" in tags:
+        return 1
+    if "shape_lexicon" in tags:
+        return 2
+    if "raw_diacritic_shape" in tags:
+        return 3
+    return 4
 
 
 def _sort_key(choice: dict[str, object]) -> tuple[object, ...]:
     rank = {"strong": 0, "medium": 1, "weak": 2}.get(str(choice.get("strength")), 3)
     return (
         rank,
+        _source_priority(choice),
         -float(choice.get("visual_score") or 0.0),
         -int(choice.get("book_frequency") or 0),
         str(choice.get("text") or ""),
     )
 
 
-def build_choice_sets(item: DeepQueueItem, stats: BookStats, max_tokens: int = 5, max_choices: int = 5) -> list[dict[str, object]]:
-    """Build constrained replacement choices for the most suspicious tokens."""
+def _downgrade_ambiguous_strong(choices: list[dict[str, object]]) -> None:
+    strong = [choice for choice in choices if choice.get("strength") == "strong"]
+    if len(strong) <= 1:
+        return
+    # Multiple locally plausible answers means semantic context must win twice.
+    for choice in strong:
+        choice["strength"] = "medium"
+        choice["ambiguous_strong"] = True
 
+
+def build_choice_sets(
+    item: DeepQueueItem,
+    stats: BookStats,
+    max_tokens: int = 5,
+    max_choices: int = 6,
+) -> list[dict[str, object]]:
     tokens = index_tokens(item.current)
     aligned = _aligned_alternatives(item)
     explicit_bad = _non_dictionary_tokens(item.reasons)
@@ -248,9 +335,8 @@ def build_choice_sets(item: DeepQueueItem, stats: BookStats, max_tokens: int = 5
         if aligned.get(token.token_id):
             score += 3.0
         if broad_suspect and stats.unigrams[old] <= 1:
-            key = shape_key(old)
-            alternatives = [word for word in stats.shape_words.get(key, ()) if word != old]
-            if alternatives:
+            alternatives = [word for word in stats.shape_words.get(shape_key(old), ()) if word != old]
+            if alternatives or "diacritic_disagreement" in item.reasons:
                 score += 1.2
         if "low_word_conf" in item.reasons and stats.unigrams[old] <= 1:
             score += 0.8
@@ -265,36 +351,35 @@ def build_choice_sets(item: DeepQueueItem, stats: BookStats, max_tokens: int = 5
         old_norm = normalize_token(old)
         proposals: dict[str, set[str]] = defaultdict(set)
 
-        # 1) Exact token spellings seen in aligned OCR alternatives.
         for value in aligned.get(token.token_id, set()):
             normalized = normalize_token(value)
             if normalized and normalized != old_norm:
                 proposals[_match_case(old, normalized)].add("ocr_direct")
 
-        # 2) Same-glyph words already seen in the book or known by Tesseract.
         old_shape = shape_key(old)
-        for value in stats.shape_words.get(old_shape, ())[:12]:
+        for value in stats.shape_words.get(old_shape, ())[:20]:
             if value != old_norm:
                 proposals[_match_case(old, value)].add("shape_lexicon")
 
-        # 3) A fused token may match an existing 2/3-word phrase elsewhere in
-        # the same book.  This deterministically generates Vidu -> Ví dụ.
-        for phrase in stats.shape_phrases.get(old_shape, ())[:8]:
+        for phrase in stats.shape_phrases.get(old_shape, ())[:10]:
             proposals[_match_case(old, phrase)].add("book_phrase")
 
-        # 4) If OCR offered an unaccented/alternate glyph seed, expand that
-        # seed through the local/lexical shape index (uạn -> van -> vạn).
-        for seed in list(aligned.get(token.token_id, set())):
+        for seed in aligned.get(token.token_id, set()):
             seed_shape = shape_key(seed)
             if not seed_shape:
                 continue
-            for value in stats.shape_words.get(seed_shape, ())[:8]:
+            for value in stats.shape_words.get(seed_shape, ())[:12]:
                 if value != old_norm:
                     proposals[_match_case(old, value)].add("ocr_shape_expand")
 
-        # 5) Explicitly suspicious OCR tokens may use one base-glyph edit to a
-        # word which actually occurs elsewhere in this book.  Book frequency
-        # ranks the options; Deep later chooses only among these options.
+        if (
+            stats.unigrams[old_norm] <= 1
+            and "diacritic_disagreement" in item.reasons
+            and len(_single_vowel_diacritic_variants(old))
+        ):
+            for value in _single_vowel_diacritic_variants(old):
+                proposals[value].add("raw_diacritic_shape")
+
         if old_norm in explicit_bad or "low_word_conf" in item.reasons:
             neighbours = [
                 (frequency, word)
@@ -309,15 +394,19 @@ def build_choice_sets(item: DeepQueueItem, stats: BookStats, max_tokens: int = 5
         for new, tags in proposals.items():
             if normalize_token(new) == old_norm or new == old:
                 continue
-            strength, metadata = _candidate_strength(item, old, new, stats, tags)
+            _, metadata = _candidate_strength(item, token.token_id, old, new, stats, tags)
             choices.append({
                 "text": new,
                 "kind": "segment" if len(_words(new)) > 1 else "replace",
                 **metadata,
             })
 
+        _downgrade_ambiguous_strong(choices)
         choices.sort(key=_sort_key)
-        choices = choices[:max_choices]
+        # Rare one-vowel diacritic disputes may need the full accent family so a
+        # valid rare word such as nhẫn is not crowded out by frequent homographs.
+        limit = 20 if stats.unigrams[old_norm] <= 1 and "diacritic_disagreement" in item.reasons else max_choices
+        choices = choices[:limit]
         if not choices:
             continue
 
