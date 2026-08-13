@@ -35,6 +35,4 @@ def confirmation_status(first: dict[str, Any], second: dict[str, Any] | None, cu
     second_sentence = " ".join(proposed_sentence(second, current).split())
     if first_sentence != second_sentence:
         return "disagreed"
-    if safe_confidence(second) < SECOND_PASS_MIN_CONFIDENCE:
-        return "low_confidence"
     return "confirmed"
