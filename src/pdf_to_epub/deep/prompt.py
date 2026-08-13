@@ -1,37 +1,35 @@
-"""Strict DeepSeek prompt for token repair and safe OCR word segmentation."""
+"""Closed-choice DeepSeek prompt for constrained OCR validation."""
 
 from __future__ import annotations
 
 import json
 
 from ..models import DeepQueueItem
-from .tokens import index_tokens
 
 
 SYSTEM_INSTRUCTION = """You are a STRICT Vietnamese OCR validator, not a writer.
 
-For every item, inspect CURRENT, TOKEN_IDS, CONTEXT and OCR_ALTERNATIVES.
-Only repair clear OCR recognition errors. Never paraphrase, improve style,
-translate, summarize, reorder, or rewrite prose. If uncertain, return no
-operation for that item.
+Local code already generated every replacement you are allowed to choose.
+You MUST NOT invent, rewrite, spell out, merge, split, or propose any text that
+is not present in CHOICE_SETS.
 
-ALLOWED OPERATIONS:
-- replace: one existing token becomes one corrected token.
-- segment: one fused OCR token becomes exactly 2 or 3 words.
+For every CHOICE_SET, choose exactly ONE choice_id:
+- KEEP means preserve the OCR token exactly as it is.
+- C1/C2/... means use exactly that candidate text.
 
-SAFETY RULES:
-1. Every operation MUST include token_id copied from TOKEN_IDS.
-2. OLD must exactly equal the text of that token_id.
-3. Prefer NEW supported by high-confidence OCR alternatives, especially when
-   support comes from different OCR families (line/whole, vie/vie+eng).
-4. A segment operation without an exact matching alternative is allowed only
-   when removing spaces/diacritics makes OLD and NEW the same glyph sequence.
-5. Do not delete text, insert unrelated words, reorder, or rewrite a sentence.
-6. Maximum 5 token-local operations per item.
-7. confidence is advisory only; do not inflate it to force an edit.
+Use CURRENT, CONTEXT, OCR_ALTERNATIVES and candidate metadata to decide.
+Prefer KEEP whenever the context does not clearly favor one listed candidate.
+Never paraphrase or improve style.  Proper names, numbers and unusual wording
+may be legitimate, so do not force a dictionary-looking choice.
 
-Return JSON ONLY:
-{"items":[{"id":"...","ops":[{"kind":"replace","token_id":"t02","old":"exact","new":"exact","confidence":0.95}]}]}
+IMPORTANT:
+1. Return one selection for EVERY CHOICE_SET, even when the answer is KEEP.
+2. Copy token_id and choice_id exactly.  Do not return OLD/NEW text.
+3. You may not create a choice_id which is absent from CHOICE_SETS.
+4. Do not omit a token merely because you are uncertain; choose KEEP instead.
+
+Return JSON ONLY in this exact shape:
+{"items":[{"id":"...","selections":[{"token_id":"t02","choice_id":"KEEP"},{"token_id":"t05","choice_id":"C1"}]}]}
 """
 
 
@@ -42,9 +40,9 @@ def build_prompt(items: list[DeepQueueItem]) -> str:
         payload.append({
             "id": item.item_id,
             "current": item.current,
-            "token_ids": [token.as_dict() for token in index_tokens(item.current)],
             "context": item.context,
             "ocr_alternatives": alternatives,
             "flags": item.reasons,
+            "choice_sets": item.choice_sets,
         })
     return SYSTEM_INSTRUCTION + "\nINPUT:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
