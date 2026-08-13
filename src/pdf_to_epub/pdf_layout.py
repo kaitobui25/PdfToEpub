@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
-import fitz
 import numpy as np
+import pymupdf as fitz
 
 
 @dataclass(frozen=True, slots=True)
