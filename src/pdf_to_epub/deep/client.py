@@ -105,6 +105,11 @@ def deepseek_call(
     OpenCode's normal config/auth files.
     """
 
+    # OpenCode receives both cwd=workdir and --dir workdir. If workdir remains
+    # relative, the child process resolves --dir again from inside workdir and
+    # ends up looking for e.g. _deep_work/runs/.../_deep_work. Resolve once at
+    # the process boundary so --dir, --file, cwd and worker DB are unambiguous.
+    workdir = workdir.resolve()
     prompt_dir = workdir / "prompts"
     prompt_dir.mkdir(parents=True, exist_ok=True)
     safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", call_name)
