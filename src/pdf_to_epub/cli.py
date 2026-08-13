@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .config import DEEP_TRUST_LEVELS, ON_OFF_CHOICES, DeepConfig, LocalTurboConfig
+from .config import DEEP_TRUST_LEVELS, ON_OFF_CHOICES, PATCH_PROJECTION_MODES, DeepConfig, LocalTurboConfig
 from .deep.polish import run_deep_only
 from .logging_utils import RunLogger
 from .pipeline import make_layout, run_local_turbo
@@ -44,15 +44,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--patch-projection",
-        choices=ON_OFF_CHOICES,
+        choices=PATCH_PROJECTION_MODES,
         default="on",
-        help="Project accepted edits back onto original OCR line breaks: on/off (default: on)",
+        help="Patch mode: on=strict layout projection, off=write Deep TARGET directly, smart=preserve layout when possible then fallback to Deep TARGET",
     )
     parser.add_argument(
         "--min-apply-confidence",
         type=float,
         default=0.97,
-        help="Minimum Deep confidence when OCR evidence gate is disabled; evidence baseline otherwise",
+        help="Minimum Deep confidence; 0.90..0.949 proposals get one independent confirmation pass",
     )
     return parser
 
@@ -78,7 +78,7 @@ def main() -> int:
             min_apply_confidence=args.min_apply_confidence,
             deep_trust=args.deep_trust,
             ocr_evidence_gate=args.ocr_evidence_gate == "on",
-            patch_projection=args.patch_projection == "on",
+            patch_projection=args.patch_projection,
         )
         if args.deep_start is None:
             log_name = "run_deep_only.log"
@@ -91,7 +91,7 @@ def main() -> int:
             logger.log(f"Model: {config.model}")
             logger.log(f"Deep trust: {config.deep_trust}")
             logger.log(f"OCR evidence gate: {'on' if config.ocr_evidence_gate else 'off'}")
-            logger.log(f"Patch projection: {'on' if config.patch_projection else 'off'}")
+            logger.log(f"Patch projection: {config.patch_projection}")
             run_deep_only(
                 layout,
                 config,
