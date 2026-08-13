@@ -35,7 +35,13 @@ def find_opencode() -> Path | None:
     return next((path for path in candidates if path.exists()), None)
 
 
-def run_exe(exe: Path, args: list[str], timeout: int = 180, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def run_exe(
+    exe: Path,
+    args: list[str],
+    timeout: int = 180,
+    cwd: Path | None = None,
+    env_overrides: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Run native/.cmd/.ps1 executables safely on Windows with UTF-8 output."""
 
     suffix = exe.suffix.casefold()
@@ -49,6 +55,8 @@ def run_exe(exe: Path, args: list[str], timeout: int = 180, cwd: Path | None = N
 
     env = os.environ.copy()
     env.update({"NO_COLOR": "1", "FORCE_COLOR": "0", "PYTHONUTF8": "1"})
+    if env_overrides:
+        env.update(env_overrides)
     return subprocess.run(
         command,
         cwd=str(cwd) if cwd else None,
@@ -88,14 +96,25 @@ def deepseek_call(
     workdir: Path,
     call_name: str,
     timeout: int,
+    database_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Call DeepSeek using a UTF-8 prompt file, matching the prior runner."""
+    """Call DeepSeek using a UTF-8 prompt file, matching the prior runner.
+
+    ``database_path`` isolates concurrent OpenCode processes from the shared
+    SQLite session database. Provider/auth configuration remains shared through
+    OpenCode's normal config/auth files.
+    """
 
     prompt_dir = workdir / "prompts"
     prompt_dir.mkdir(parents=True, exist_ok=True)
     safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", call_name)
     prompt_file = prompt_dir / f"{safe_name}.txt"
     prompt_file.write_text(prompt, encoding="utf-8", newline="\n")
+
+    env_overrides: dict[str, str] = {}
+    if database_path is not None:
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        env_overrides["OPENCODE_DB"] = str(database_path.resolve())
 
     cp = run_exe(
         opencode,
@@ -111,6 +130,7 @@ def deepseek_call(
         ],
         timeout=timeout,
         cwd=workdir,
+        env_overrides=env_overrides,
     )
     combined = (cp.stdout or "") + "\n" + (cp.stderr or "")
     if cp.returncode != 0:
