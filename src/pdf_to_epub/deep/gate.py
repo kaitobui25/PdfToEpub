@@ -1,19 +1,24 @@
-"""Evidence-aware safety gate for DeepSeek OCR corrections.
+"""Evidence-aware safety gates for DeepSeek OCR corrections.
 
 DeepSeek proposes edits; this module decides whether independent OCR evidence is
-strong enough to apply them. Confidence is therefore not a global on/off switch:
-a lower-confidence suggestion can pass when OCR alternatives agree, while an
-unsupported rewrite remains blocked even at high confidence.
+strong enough to apply them. The legacy token gate remains for compatibility,
+while sentence mode validates every changed phrase first and then applies the
+entire sentence atomically: all changes pass, or none of them are written.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from difflib import SequenceMatcher
 import re
 from typing import Any
 
 from ..models import DeepQueueItem
-from ..ocr.scoring import diacritic_only, normalize_token, shape_key
+from ..ocr.scoring import normalize_token, shape_key
+
+
+SENTENCE_TOKEN_RE = re.compile(r"[0-9A-Za-zÀ-ỹĐđ]+|[^\w\s]", re.UNICODE)
+WORD_TOKEN_RE = re.compile(r"^[0-9A-Za-zÀ-ỹĐđ]+$", re.UNICODE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,7 +38,7 @@ def _normalized_words(text: str) -> list[str]:
 
 
 def _candidate_contains_sequence(candidate: str, value: str) -> bool:
-    """Match one token or a short segmented phrase inside an OCR alternative."""
+    """Match one token or a short phrase inside an OCR alternative."""
 
     candidate_words = _normalized_words(candidate)
     wanted = _normalized_words(value)
@@ -46,7 +51,7 @@ def _candidate_contains_sequence(candidate: str, value: str) -> bool:
 def _evidence(item: DeepQueueItem, old: str, new: str) -> EvidenceProfile:
     old_votes = sum(1 for candidate in item.candidates if _candidate_contains_sequence(candidate, old))
     new_votes = sum(1 for candidate in item.candidates if _candidate_contains_sequence(candidate, new))
-    segmented = len(new.split()) > 1
+    segmented = len(new.split()) > len(old.split())
     return EvidenceProfile(
         old_votes=old_votes,
         new_votes=new_votes,
@@ -88,14 +93,7 @@ def _valid_segment(old: str, new: str) -> bool:
 
 
 def _required_confidence(base: float, evidence: EvidenceProfile) -> float | None:
-    """Convert independent visual support into a dynamic confidence threshold.
-
-    With the default base=0.97:
-      - 2+ OCR alternatives supporting NEW: threshold 0.92
-      - 1 OCR alternative supporting NEW: threshold 0.95
-      - shape-preserving candidate support (diacritics/segmentation): up to 0.02 lower
-      - no visual NEW support: only shape-preserving edits at >=0.98
-    """
+    """Convert independent visual support into a dynamic confidence threshold."""
 
     if evidence.new_votes >= 2:
         threshold = max(0.90, base - 0.05)
@@ -118,7 +116,7 @@ def apply_ai_ops(
     min_confidence: float,
     max_ops: int = 3,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Apply only token-local repairs supported by OCR evidence or glyph shape."""
+    """Legacy token-local gate retained for regression compatibility."""
 
     current = item.current
     audited: list[dict[str, Any]] = []
@@ -187,3 +185,150 @@ def apply_ai_ops(
         audited.append(record)
 
     return current, audited
+
+
+def _sentence_tokens(text: str) -> list[str]:
+    return SENTENCE_TOKEN_RE.findall(text)
+
+
+def _sentence_change_records(current: str, proposed: str) -> tuple[list[dict[str, Any]], str | None, int]:
+    """Describe lexical replacement spans; reject insert/delete/reordering/punctuation edits."""
+
+    before = _sentence_tokens(current)
+    after = _sentence_tokens(proposed)
+    matcher = SequenceMatcher(a=before, b=after, autojunk=False)
+    records: list[dict[str, Any]] = []
+    changed_words = 0
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        old_parts = before[i1:i2]
+        new_parts = after[j1:j2]
+        if tag in {"insert", "delete"} or not old_parts or not new_parts:
+            return records, "sentence_insert_delete_or_reorder", changed_words
+        if not all(WORD_TOKEN_RE.fullmatch(token) for token in [*old_parts, *new_parts]):
+            return records, "sentence_punctuation_change", changed_words
+        changed_words += max(len(old_parts), len(new_parts))
+        records.append(
+            {
+                "kind": "sentence_span",
+                "old": " ".join(old_parts),
+                "new": " ".join(new_parts),
+                "old_words": len(old_parts),
+                "new_words": len(new_parts),
+                "gate": "",
+                "applied": False,
+            }
+        )
+    return records, None, changed_words
+
+
+def apply_ai_sentence(
+    item: DeepQueueItem,
+    ai_raw: dict[str, Any],
+    min_confidence: float,
+    max_changed_words: int = 6,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Validate a complete proposed sentence and apply it only as one atomic unit.
+
+    Deep may repair several related OCR tokens in one sentence. Local code diffs
+    the proposal into short lexical spans, validates every span against OCR
+    alternatives/glyph shape, and writes the proposed sentence only if every
+    changed span passes. This prevents half-corrections such as ``bắt đâu``.
+    """
+
+    proposed_value = ai_raw.get("corrected_sentence") if isinstance(ai_raw, dict) else None
+    if proposed_value is None:
+        return item.current, [
+            {
+                "kind": "sentence",
+                "old": item.current,
+                "new": "",
+                "confidence": 0.0,
+                "gate": "missing_corrected_sentence",
+                "applied": False,
+            }
+        ]
+
+    proposed = str(proposed_value).strip()
+    current = item.current.strip()
+    try:
+        confidence = float(ai_raw.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    if proposed == current:
+        return item.current, []
+    if not proposed:
+        return item.current, [
+            {
+                "kind": "sentence",
+                "old": current,
+                "new": proposed,
+                "confidence": confidence,
+                "gate": "empty_sentence",
+                "applied": False,
+            }
+        ]
+
+    changes, structural_error, changed_words = _sentence_change_records(current, proposed)
+    if structural_error:
+        return item.current, [
+            {
+                "kind": "sentence",
+                "old": current,
+                "new": proposed,
+                "confidence": confidence,
+                "gate": structural_error,
+                "applied": False,
+            }
+        ]
+    if not changes:
+        return item.current, []
+
+    total_words = sum(1 for token in _sentence_tokens(current) if WORD_TOKEN_RE.fullmatch(token))
+    if changed_words > max_changed_words or (total_words >= 10 and changed_words / max(1, total_words) > 0.40):
+        return item.current, [
+            {
+                "kind": "sentence",
+                "old": current,
+                "new": proposed,
+                "confidence": confidence,
+                "changed_words": changed_words,
+                "gate": "sentence_rewrite_too_large",
+                "applied": False,
+            }
+        ]
+
+    all_pass = True
+    for record in changes:
+        old = str(record["old"])
+        new = str(record["new"])
+        evidence = _evidence(item, old, new)
+        required = _required_confidence(min_confidence, evidence)
+        record["confidence"] = confidence
+        record["evidence"] = evidence.as_dict()
+        record["required_confidence"] = required
+        if required is None:
+            record["gate"] = "unsupported_sentence_span"
+            all_pass = False
+        elif confidence < required:
+            record["gate"] = "insufficient_sentence_confidence"
+            all_pass = False
+        else:
+            record["gate"] = (
+                "sentence_ocr_evidence"
+                if evidence.new_votes
+                else "sentence_shape_preserving"
+            )
+
+    if not all_pass:
+        for record in changes:
+            if record["gate"] in {"sentence_ocr_evidence", "sentence_shape_preserving"}:
+                record["gate"] = "atomic_rejected_due_to_other_span"
+        return item.current, changes
+
+    for record in changes:
+        record["applied"] = True
+    return proposed, changes
