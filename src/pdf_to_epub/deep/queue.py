@@ -7,10 +7,11 @@ from math import ceil
 from pathlib import Path
 import re
 from statistics import median
-from typing import Any
+from typing import Any, Iterable
 
 from ..jsonio import read_json
 from ..models import DeepQueueItem
+from .candidates import build_book_stats, build_choice_sets
 
 MARKER_RE = re.compile(r"^===== PDF(\d{3})-([LR]) =====$")
 LEXICAL_RE = re.compile(r"[0-9A-Za-zÀ-ỹĐđ]+", re.UNICODE)
@@ -97,13 +98,7 @@ def _best_candidate_confidence(row: dict[str, Any]) -> float:
 
 
 def find_legacy_catastrophic_sides(audit: list[dict[str, Any]]) -> set[tuple[int, str]]:
-    """Detect collapsed sides in old LOCAL outputs that predate health.py.
-
-    This is intentionally a high-precision guard, not a replacement for the
-    pixel-based whole-side health detector. It only suppresses Deep token repair
-    when a side has many low-confidence suspect rows and the median best OCR
-    evidence is itself poor.
-    """
+    """Detect collapsed sides in old LOCAL outputs that predate health.py."""
 
     grouped: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
     for row in audit:
@@ -135,8 +130,6 @@ def find_legacy_catastrophic_sides(audit: list[dict[str, Any]]) -> set[tuple[int
 
 
 def _candidate_metadata(row: dict[str, Any]) -> list[dict[str, Any]]:
-    """Preserve source/confidence metadata for local weighted evidence scoring."""
-
     result: list[dict[str, Any]] = []
     for key in ("line_candidates", "whole_candidates"):
         for candidate in row.get(key, []):
@@ -154,11 +147,16 @@ def _candidate_metadata(row: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-def build_queue(local_txt: Path, local_refine_audit: Path) -> tuple[list[DeepQueueItem], int]:
+def build_queue(
+    local_txt: Path,
+    local_refine_audit: Path,
+    lexicon: Iterable[str] = (),
+) -> tuple[list[DeepQueueItem], int]:
     output = local_txt.read_text(encoding="utf-8")
     pages = _flatten_output_lines(output)
     audit: list[dict[str, Any]] = read_json(local_refine_audit)
     legacy_catastrophic = find_legacy_catastrophic_sides(audit)
+    stats = build_book_stats(output, lexicon)
     queue: list[DeepQueueItem] = []
     skipped = 0
 
@@ -198,17 +196,23 @@ def build_queue(local_txt: Path, local_refine_audit: Path) -> tuple[list[DeepQue
             if _lexical(text) != _lexical(current) and text not in candidates:
                 candidates.append(text)
 
-        queue.append(
-            DeepQueueItem(
-                item_id=str(row["id"]),
-                page_number=page_number,
-                side=side,
-                current=current,
-                output_line=target,
-                context=_context(page_lines, target),
-                reasons=reasons,
-                candidates=candidates[:8],
-                candidate_meta=metadata,
-            )
+        item = DeepQueueItem(
+            item_id=str(row["id"]),
+            page_number=page_number,
+            side=side,
+            current=current,
+            output_line=target,
+            context=_context(page_lines, target),
+            reasons=reasons,
+            candidates=candidates[:8],
+            candidate_meta=metadata,
         )
+        item.choice_sets = build_choice_sets(item, stats)
+        # No local candidate means there is nothing safe for Deep to invent.
+        # KEEP locally instead of paying for an unconstrained generation call.
+        if not item.choice_sets:
+            skipped += 1
+            continue
+        queue.append(item)
+
     return queue, skipped
