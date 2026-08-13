@@ -36,7 +36,9 @@ class DeepConfig:
     workers: int = 4
     min_apply_confidence: float = 0.97
     call_timeout_seconds: int = 120
-    max_ops_per_item: int = 3
+    # Token IDs keep each edit local, so allowing five operations is safer than
+    # forcing a four-error OCR line to leave one known error behind.
+    max_ops_per_item: int = 5
 
 
 @dataclass(frozen=True, slots=True)
