@@ -60,7 +60,7 @@ def _render_corrected_target(
         return item.output_line if corrected == item.current else None
 
     if any(
-        change.get("gate") in {"sentence_whole_ocr_candidate", "sentence_deep_trust_structural"}
+        change.get("gate") in {"sentence_whole_ocr_candidate", "sentence_deep_trust_structural", "sentence_deep_direct"}
         for change in applied
     ):
         return corrected
@@ -126,6 +126,8 @@ def _log_result_summary(log: Callable[[str], None], summary: dict[str, Any]) -> 
     log("")
     log("================ DEEP RESULT ================")
     log(f"Deep trust            : {summary['deep_trust']}")
+    log(f"OCR evidence gate     : {summary['ocr_evidence_gate']}")
+    log(f"Patch projection      : {summary['patch_projection']}")
     log(f"Suspect TARGETs       : {summary['queue_items']} ({summary['queue_source_lines']} OCR source lines)")
     log(
         f"Deep proposed changes : {summary['deep_proposed_sentences']} TARGETs / "
@@ -135,7 +137,7 @@ def _log_result_summary(log: Callable[[str], None], summary: dict[str, Any]) -> 
         f"Applied to TXT        : {summary['applied_sentences']} TARGETs / "
         f"{summary['applied_spans']} repair groups"
     )
-    log(f"Blocked by gate       : {summary['gate_blocked_sentences']} TARGETs")
+    log(f"Blocked               : {summary['gate_blocked_sentences']} TARGETs")
     log(f"Patch projection fail : {summary['patch_projection_failures']} TARGETs")
     log(f"Deep kept unchanged   : {summary['deep_unchanged_sentences']} TARGETs")
     log(f"Skipped before Deep   : {summary['skipped_items']} items")
@@ -193,6 +195,8 @@ def run_deep_only(
         f"skipped_lines={len(skipped_records)}"
     )
     log(f"Deep trust: {config.deep_trust}")
+    log(f"OCR evidence gate: {'on' if config.ocr_evidence_gate else 'off'}")
+    log(f"Patch projection: {'on' if config.patch_projection else 'off'}")
     log(f"Micro-batch: {config.batch_size} sentences; parallel AI workers: {config.workers}")
     log(f"AI calls: {len(batches)} total, max {config.workers} concurrent")
 
@@ -288,6 +292,7 @@ def run_deep_only(
             config.min_apply_confidence,
             max_changed_words=max(6, config.max_ops_per_item * 2),
             deep_trust=config.deep_trust,
+            ocr_evidence_gate=config.ocr_evidence_gate,
         )
         if ai_changed:
             deep_proposed_repair_groups += max(1, len(changes))
@@ -300,10 +305,13 @@ def run_deep_only(
         rendered: str | None = None
         txt_applied = False
         if gate_changed:
-            rendered = _render_corrected_target(item, corrected, changes)
-            if rendered is None:
-                projection_failures += 1
+            if config.patch_projection:
+                rendered = _render_corrected_target(item, corrected, changes)
+                if rendered is None:
+                    projection_failures += 1
             else:
+                rendered = corrected
+            if rendered is not None:
                 replacements[item.output_line] = rendered
                 applied_sentences += 1
                 applied_spans += sum(1 for change in changes if change.get("applied"))
@@ -319,14 +327,18 @@ def run_deep_only(
                 "corrected": corrected,
                 "changes": changes,
                 "deep_trust": config.deep_trust,
+                "ocr_evidence_gate": config.ocr_evidence_gate,
+                "patch_projection": config.patch_projection,
                 "deep_proposed_change": ai_changed,
                 "gate_accepted_sentence": gate_changed,
                 "applied_sentence": txt_applied,
                 "txt_gate": (
-                    "applied_atomic_sentence"
+                    "applied_deep_direct"
+                    if txt_applied and not config.patch_projection
+                    else "applied_atomic_sentence"
                     if txt_applied
                     else "patch_projection_failed"
-                    if gate_changed
+                    if gate_changed and config.patch_projection
                     else "keep_local"
                 ),
                 "ai_raw": ai_raw,
@@ -345,6 +357,8 @@ def run_deep_only(
         "source": str(layout.root),
         "model": config.model,
         "deep_trust": config.deep_trust,
+        "ocr_evidence_gate": "on" if config.ocr_evidence_gate else "off",
+        "patch_projection": "on" if config.patch_projection else "off",
         "queue_unit": "sentence",
         "context_window": "previous+target+next; target-only editable",
         "page_filter": [page_start, page_end] if suffix else None,
