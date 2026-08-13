@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .config import DEEP_TRUST_LEVELS, DeepConfig, LocalTurboConfig
+from .config import DEEP_TRUST_LEVELS, ON_OFF_CHOICES, DeepConfig, LocalTurboConfig
 from .deep.polish import run_deep_only
 from .logging_utils import RunLogger
 from .pipeline import make_layout, run_local_turbo
@@ -37,10 +37,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Deep correction authority: strict, balanced, or high (default: high)",
     )
     parser.add_argument(
+        "--ocr-evidence-gate",
+        choices=ON_OFF_CHOICES,
+        default="on",
+        help="Use OCR candidates to veto Deep corrections: on/off (default: on)",
+    )
+    parser.add_argument(
+        "--patch-projection",
+        choices=ON_OFF_CHOICES,
+        default="on",
+        help="Project accepted edits back onto original OCR line breaks: on/off (default: on)",
+    )
+    parser.add_argument(
         "--min-apply-confidence",
         type=float,
         default=0.97,
-        help="Advanced OCR-evidence confidence baseline; --deep-trust is the main correction setting",
+        help="Minimum Deep confidence when OCR evidence gate is disabled; evidence baseline otherwise",
     )
     return parser
 
@@ -65,6 +77,8 @@ def main() -> int:
             workers=args.ai_workers,
             min_apply_confidence=args.min_apply_confidence,
             deep_trust=args.deep_trust,
+            ocr_evidence_gate=args.ocr_evidence_gate == "on",
+            patch_projection=args.patch_projection == "on",
         )
         if args.deep_start is None:
             log_name = "run_deep_only.log"
@@ -76,6 +90,8 @@ def main() -> int:
             logger.log("OCR/Tesseract: SKIPPED (reuse existing FIX3 output)")
             logger.log(f"Model: {config.model}")
             logger.log(f"Deep trust: {config.deep_trust}")
+            logger.log(f"OCR evidence gate: {'on' if config.ocr_evidence_gate else 'off'}")
+            logger.log(f"Patch projection: {'on' if config.patch_projection else 'off'}")
             run_deep_only(
                 layout,
                 config,
