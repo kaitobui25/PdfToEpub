@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .config import DeepConfig, LocalTurboConfig
+from .config import DEEP_TRUST_LEVELS, DeepConfig, LocalTurboConfig
 from .deep.polish import run_deep_only
 from .logging_utils import RunLogger
 from .pipeline import make_layout, run_local_turbo
@@ -30,7 +30,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=DeepConfig().model, help="OpenCode model for --deep-only")
     parser.add_argument("--ai-batch-size", type=int, default=6, help="Deep-only items per model call (default: 6)")
     parser.add_argument("--ai-workers", type=int, default=4, help="Parallel Deep-only calls (default: 4)")
-    parser.add_argument("--min-apply-confidence", type=float, default=0.97, help="Minimum Deep correction confidence")
+    parser.add_argument(
+        "--deep-trust",
+        choices=DEEP_TRUST_LEVELS,
+        default=DeepConfig().deep_trust,
+        help="Deep correction authority: strict, balanced, or high (default: high)",
+    )
+    parser.add_argument(
+        "--min-apply-confidence",
+        type=float,
+        default=0.97,
+        help="Advanced OCR-evidence confidence baseline; --deep-trust is the main correction setting",
+    )
     return parser
 
 
@@ -53,6 +64,7 @@ def main() -> int:
             batch_size=args.ai_batch_size,
             workers=args.ai_workers,
             min_apply_confidence=args.min_apply_confidence,
+            deep_trust=args.deep_trust,
         )
         if args.deep_start is None:
             log_name = "run_deep_only.log"
@@ -63,6 +75,7 @@ def main() -> int:
             logger.log(f"Source: {layout.root}")
             logger.log("OCR/Tesseract: SKIPPED (reuse existing FIX3 output)")
             logger.log(f"Model: {config.model}")
+            logger.log(f"Deep trust: {config.deep_trust}")
             run_deep_only(
                 layout,
                 config,
