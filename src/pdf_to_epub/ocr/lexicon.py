@@ -1,9 +1,14 @@
 """Best-effort access to Tesseract's Vietnamese word DAWG.
 
-The pipeline never downloads dictionaries.  It discovers the local Tesseract
-installation, extracts `vie.traineddata` when helper tools are present, and
-caches the word list under the run work directory.  OCR still runs if this
-optional lexical evidence is unavailable.
+The pipeline never downloads dictionaries. It discovers the local Tesseract
+installation, extracts the installed `vie.traineddata`, converts its word DAWG
+to a UTF-8 word list, and caches that list under the run work directory.
+
+Windows Tesseract distributions are slightly inconsistent around component
+extraction paths, so this module never assumes that `combine_tessdata -u`
+created one exact filename. It first extracts the two required components with
+`-e`, then falls back to full unpack + suffix discovery. Failures are written to
+a small status file instead of being silently swallowed.
 """
 
 from __future__ import annotations
@@ -43,7 +48,6 @@ def _tessdata_candidates() -> Iterable[Path]:
         yield exe.parent.parent / "share" / "tesseract-ocr" / "5" / "tessdata"
         yield exe.parent.parent / "share" / "tesseract-ocr" / "4.00" / "tessdata"
 
-    # Common Windows locations when tesseract is not on PATH but is installed.
     for env_name in ("ProgramFiles", "ProgramFiles(x86)"):
         value = os.environ.get(env_name)
         if value:
@@ -66,50 +70,130 @@ def _find_traineddata(language: str) -> Path | None:
     return None
 
 
-def load_vietnamese_words(work_dir: Path) -> set[str]:
-    cache = work_dir / "vie_lexicon" / "vie.words.txt"
-    if cache.exists():
-        return {
-            line.strip().casefold()
-            for line in cache.read_text(encoding="utf-8", errors="ignore").splitlines()
-            if line.strip()
-        }
+def lexicon_status_path(work_dir: Path) -> Path:
+    return work_dir / "vie_lexicon" / "status.txt"
 
-    combine = _program("combine_tessdata")
-    dawg2words = _program("dawg2wordlist")
-    trained = _find_traineddata("vie")
-    if not combine or not dawg2words or trained is None:
-        return set()
 
-    out_dir = cache.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-    prefix = out_dir / "vie."
-    try:
-        subprocess.run(
-            [combine, "-u", str(trained), str(prefix)],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        dawg = out_dir / "vie.lstm-word-dawg"
-        charset = out_dir / "vie.lstm-unicharset"
-        if not dawg.exists() or not charset.exists():
-            return set()
-        subprocess.run(
-            [dawg2words, str(charset), str(dawg), str(cache)],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return set()
+def _write_status(work_dir: Path, lines: list[str]) -> None:
+    path = lexicon_status_path(work_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
-    if not cache.exists():
+
+def _read_words(cache: Path) -> set[str]:
+    if not cache.exists() or cache.stat().st_size == 0:
         return set()
     return {
         line.strip().casefold()
         for line in cache.read_text(encoding="utf-8", errors="ignore").splitlines()
         if line.strip()
     }
+
+
+def _run(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+
+
+def _component_pairs(out_dir: Path) -> list[tuple[Path, Path, str]]:
+    """Return usable (unicharset, word-dawg, label) pairs, LSTM first."""
+
+    files = [path for path in out_dir.iterdir() if path.is_file()]
+
+    def find_suffix(suffix: str) -> list[Path]:
+        return sorted((path for path in files if path.name.casefold().endswith(suffix.casefold())), key=lambda p: p.name)
+
+    pairs: list[tuple[Path, Path, str]] = []
+    lstm_sets = find_suffix(".lstm-unicharset")
+    lstm_dawgs = find_suffix(".lstm-word-dawg")
+    if lstm_sets and lstm_dawgs:
+        pairs.append((lstm_sets[0], lstm_dawgs[0], "lstm"))
+
+    legacy_sets = [path for path in find_suffix(".unicharset") if not path.name.casefold().endswith(".lstm-unicharset")]
+    legacy_dawgs = [path for path in find_suffix(".word-dawg") if not path.name.casefold().endswith(".lstm-word-dawg")]
+    if legacy_sets and legacy_dawgs:
+        pairs.append((legacy_sets[0], legacy_dawgs[0], "legacy"))
+    return pairs
+
+
+def _extract_components(combine: str, trained: Path, out_dir: Path, status: list[str]) -> list[tuple[Path, Path, str]]:
+    # Prefer targeted extraction. It avoids relying on how Windows handles a
+    # PATHPREFIX ending in a period for `combine_tessdata -u`.
+    lstm_charset = out_dir / "vie.lstm-unicharset"
+    lstm_dawg = out_dir / "vie.lstm-word-dawg"
+    targeted = _run([combine, "-e", str(trained), str(lstm_charset), str(lstm_dawg)])
+    status.append(f"targeted_extract_rc={targeted.returncode}")
+    if targeted.stdout.strip():
+        status.append("targeted_stdout=" + targeted.stdout.strip().replace("\n", " | "))
+    if targeted.stderr.strip():
+        status.append("targeted_stderr=" + targeted.stderr.strip().replace("\n", " | "))
+
+    pairs = _component_pairs(out_dir)
+    if pairs:
+        return pairs
+
+    # Some traineddata variants/distributions behave better with a full unpack.
+    # Discover the actual filenames afterwards instead of assuming one prefix.
+    prefix = str(out_dir / "vie_unpack") + "."
+    unpacked = _run([combine, "-u", str(trained), prefix])
+    status.append(f"full_unpack_rc={unpacked.returncode}")
+    if unpacked.stdout.strip():
+        status.append("unpack_stdout=" + unpacked.stdout.strip().replace("\n", " | "))
+    if unpacked.stderr.strip():
+        status.append("unpack_stderr=" + unpacked.stderr.strip().replace("\n", " | "))
+    return _component_pairs(out_dir)
+
+
+def load_vietnamese_words(work_dir: Path) -> set[str]:
+    out_dir = work_dir / "vie_lexicon"
+    cache = out_dir / "vie.words.txt"
+    cached = _read_words(cache)
+    if cached:
+        _write_status(work_dir, [f"source=cache", f"words={len(cached)}", f"cache={cache}"])
+        return cached
+    if cache.exists():
+        cache.unlink(missing_ok=True)
+
+    combine = _program("combine_tessdata")
+    dawg2words = _program("dawg2wordlist")
+    trained = _find_traineddata("vie")
+    status = [
+        f"combine_tessdata={combine or 'NOT_FOUND'}",
+        f"dawg2wordlist={dawg2words or 'NOT_FOUND'}",
+        f"vie_traineddata={trained or 'NOT_FOUND'}",
+    ]
+    if not combine or not dawg2words or trained is None:
+        _write_status(work_dir, status + ["result=unavailable_dependency"])
+        return set()
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        pairs = _extract_components(combine, trained, out_dir, status)
+        status.append("discovered_pairs=" + ",".join(label for _, _, label in pairs))
+        for charset, dawg, label in pairs:
+            cache.unlink(missing_ok=True)
+            converted = _run([dawg2words, str(charset), str(dawg), str(cache)])
+            status.append(f"dawg2wordlist[{label}]_rc={converted.returncode}")
+            if converted.stdout.strip():
+                status.append(f"dawg2wordlist[{label}]_stdout=" + converted.stdout.strip().replace("\n", " | "))
+            if converted.stderr.strip():
+                status.append(f"dawg2wordlist[{label}]_stderr=" + converted.stderr.strip().replace("\n", " | "))
+            words = _read_words(cache)
+            if words:
+                status.extend([f"selected_pair={label}", f"words={len(words)}", "result=ok"])
+                _write_status(work_dir, status)
+                return words
+    except (OSError, subprocess.SubprocessError) as exc:
+        status.append(f"exception={type(exc).__name__}:{exc}")
+
+    cache.unlink(missing_ok=True)
+    status.append("result=no_wordlist")
+    _write_status(work_dir, status)
+    return set()
