@@ -4,11 +4,11 @@ The pipeline never downloads dictionaries. It discovers the local Tesseract
 installation, extracts the installed `vie.traineddata`, converts its word DAWG
 to a UTF-8 word list, and caches that list under the run work directory.
 
-Windows Tesseract distributions are slightly inconsistent around component
-extraction paths, so this module never assumes that `combine_tessdata -u`
-created one exact filename. It first extracts the two required components with
-`-e`, then falls back to full unpack + suffix discovery. Failures are written to
-a small status file instead of being silently swallowed.
+Windows Tesseract distributions are slightly inconsistent around PATH and
+component extraction paths. Discovery therefore uses the traineddata install
+root as the strongest executable hint, then PATH/TESSERACT_CMD/common Windows
+install locations. Failures are written to a small status file instead of being
+silently swallowed.
 """
 
 from __future__ import annotations
@@ -20,15 +20,49 @@ import subprocess
 from typing import Iterable
 
 
-def _program(name: str) -> str | None:
+def _exe_name(name: str) -> str:
+    return name + (".exe" if os.name == "nt" and not name.lower().endswith(".exe") else "")
+
+
+def _program(name: str, install_root: Path | None = None) -> str | None:
+    """Find a Tesseract companion executable without relying only on PATH."""
+
     direct = shutil.which(name)
     if direct:
         return direct
-    tess = os.environ.get("TESSERACT_CMD") or shutil.which("tesseract")
-    if tess:
-        candidate = Path(tess).with_name(name + (".exe" if os.name == "nt" else ""))
-        if candidate.exists():
-            return str(candidate)
+
+    exe_name = _exe_name(name)
+    candidates: list[Path] = []
+
+    # Strongest hint: vie.traineddata lives in <install>/tessdata, so its parent
+    # is exactly where Windows installers normally place the helper executables.
+    if install_root is not None:
+        candidates.extend((install_root / exe_name, install_root / "bin" / exe_name))
+
+    configured_tess = os.environ.get("TESSERACT_CMD") or shutil.which("tesseract")
+    if configured_tess:
+        tess_dir = Path(configured_tess).resolve().parent
+        candidates.extend((tess_dir / exe_name, tess_dir / "bin" / exe_name))
+
+    # PowerShell/where.exe and Python's shutil.which can disagree on some Windows
+    # setups, so probe the standard installation roots explicitly as a fallback.
+    for env_name in ("ProgramFiles", "ProgramFiles(x86)"):
+        value = os.environ.get(env_name)
+        if value:
+            root = Path(value) / "Tesseract-OCR"
+            candidates.extend((root / exe_name, root / "bin" / exe_name))
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists() and resolved.is_file():
+            return str(resolved)
     return None
 
 
@@ -156,15 +190,17 @@ def load_vietnamese_words(work_dir: Path) -> set[str]:
     cache = out_dir / "vie.words.txt"
     cached = _read_words(cache)
     if cached:
-        _write_status(work_dir, [f"source=cache", f"words={len(cached)}", f"cache={cache}"])
+        _write_status(work_dir, ["source=cache", f"words={len(cached)}", f"cache={cache}"])
         return cached
     if cache.exists():
         cache.unlink(missing_ok=True)
 
-    combine = _program("combine_tessdata")
-    dawg2words = _program("dawg2wordlist")
     trained = _find_traineddata("vie")
+    install_root = trained.parent.parent if trained is not None else None
+    combine = _program("combine_tessdata", install_root)
+    dawg2words = _program("dawg2wordlist", install_root)
     status = [
+        f"install_root={install_root or 'NOT_FOUND'}",
         f"combine_tessdata={combine or 'NOT_FOUND'}",
         f"dawg2wordlist={dawg2words or 'NOT_FOUND'}",
         f"vie_traineddata={trained or 'NOT_FOUND'}",
