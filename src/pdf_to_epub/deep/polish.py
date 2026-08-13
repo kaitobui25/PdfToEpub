@@ -147,6 +147,11 @@ def run_deep_only(
 
     ai_wall = time.perf_counter() - ai_start
     log(f"[AI WALL] {ai_wall:.2f}s")
+    if failed_calls:
+        raise RuntimeError(
+            f"Deep-only incomplete: {failed_calls}/{len(batches)} AI calls failed. "
+            "Refusing to write a partial Deep TXT/EPUB; rerun Deep-only."
+        )
 
     audit: list[dict[str, Any]] = []
     replacements: dict[str, str] = {}
