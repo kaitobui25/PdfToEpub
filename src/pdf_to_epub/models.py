@@ -1,8 +1,4 @@
-"""Shared immutable-ish data structures used across pipeline stages.
-
-Keeping stage contracts in one module prevents the OCR, cleanup, EPUB and AI
-layers from depending on each other's implementation details.
-"""
+"""Shared data contracts between PDF, OCR, cleanup, EPUB and Deep stages."""
 
 from __future__ import annotations
 
@@ -13,8 +9,6 @@ from typing import Any
 
 @dataclass(slots=True)
 class OCRCandidate:
-    """One OCR interpretation of the same visual line."""
-
     source: str
     text: str
     confidence: float
@@ -38,8 +32,6 @@ class OCRCandidate:
 
 @dataclass(slots=True)
 class OCRLine:
-    """A selected OCR line plus geometry and evidence from alternate passes."""
-
     line_id: str
     page_number: int
     side: str
@@ -61,7 +53,7 @@ class OCRLine:
 
 @dataclass(slots=True)
 class BookSide:
-    """Logical left/right book page produced from one scanned PDF spread."""
+    """Logical left/right page plus quality flags owned by whole-side analysis."""
 
     page_number: int
     side: str
@@ -69,6 +61,7 @@ class BookSide:
     lines: list[OCRLine] = field(default_factory=list)
     paragraphs: list[str] = field(default_factory=list)
     selected_pass: str = ""
+    quality_flags: list[str] = field(default_factory=list)
 
     @property
     def tag(self) -> str:
@@ -77,8 +70,6 @@ class BookSide:
 
 @dataclass(slots=True)
 class DeepQueueItem:
-    """Minimal evidence sent to the Deep-only validator."""
-
     item_id: str
     page_number: int
     side: str

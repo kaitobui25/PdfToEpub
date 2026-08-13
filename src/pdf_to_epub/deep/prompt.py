@@ -1,4 +1,4 @@
-"""Strict DeepSeek prompt used by the tested Deep-only mode."""
+"""Strict DeepSeek prompt for token repair and safe OCR word segmentation."""
 
 from __future__ import annotations
 
@@ -13,17 +13,21 @@ For every item, inspect CURRENT together with CONTEXT and OCR_ALTERNATIVES.
 Only repair clear OCR recognition errors. Never paraphrase, improve style, translate, summarize, reorder, or rewrite prose.
 If uncertain, return no operation for that item.
 
+ALLOWED OPERATIONS:
+- replace: OLD and NEW are each one OCR token.
+- segment: OLD is one fused OCR token and NEW is exactly 2 or 3 words that the token should have been split into, e.g. "Vidu" -> "Ví dụ".
+
 SAFETY RULES:
-1. Each operation must replace a NON-EMPTY exact substring copied from CURRENT.
-2. OLD and NEW must each be ONE OCR token (no spaces). For multiple errors, emit separate operations.
-3. Prefer a spelling visibly present in OCR_ALTERNATIVES.
-4. If NEW is not present in an OCR alternative, it may differ from OLD only by Vietnamese diacritics/case.
-5. No deletion, no insertion, no sentence rewrite.
-6. Maximum 3 operations per item.
-7. confidence is 0..1. Use >=0.97 only when essentially certain.
+1. OLD must be a NON-EMPTY exact token copied from CURRENT.
+2. Prefer NEW visibly supported by OCR_ALTERNATIVES.
+3. A segment operation without a matching alternative is allowed only when removing spaces/diacritics makes OLD and NEW the same glyph sequence.
+4. Do not delete text, insert unrelated words, change word order, or rewrite a sentence.
+5. Maximum 3 operations per item.
+6. confidence is 0..1. Use high confidence only when the correction is clear.
 
 Return JSON ONLY in this exact shape:
-{"items":[{"id":"...","ops":[{"old":"exact","new":"exact","confidence":0.99}]}]}
+{"items":[{"id":"...","ops":[{"kind":"replace","old":"exact","new":"exact","confidence":0.99}]}]}
+For segmentation use kind="segment" and NEW may contain one or two spaces.
 """
 
 
