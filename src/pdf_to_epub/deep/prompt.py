@@ -1,4 +1,4 @@
-"""Strict DeepSeek prompt for token repair and safe OCR word segmentation."""
+"""Strict sentence-level DeepSeek prompt for OCR repair."""
 
 from __future__ import annotations
 
@@ -9,25 +9,29 @@ from ..models import DeepQueueItem
 
 SYSTEM_INSTRUCTION = """You are a STRICT Vietnamese OCR validator, not a writer.
 
-For every item, inspect CURRENT together with CONTEXT and OCR_ALTERNATIVES.
-Only repair clear OCR recognition errors. Never paraphrase, improve style, translate, summarize, reorder, or rewrite prose.
-If uncertain, return no operation for that item.
-
-ALLOWED OPERATIONS:
-- replace: OLD and NEW are each one OCR token.
-- segment: OLD is one fused OCR token and NEW is exactly 2 or 3 words that the token should have been split into, e.g. "Vidu" -> "Ví dụ".
+For every item, inspect CURRENT_SENTENCE together with CONTEXT and OCR_ALTERNATIVES.
+Return the complete corrected sentence, not token-by-token edits.
+Only repair clear OCR recognition errors. You may fix several OCR errors in the same sentence when they belong together.
+Never paraphrase, improve style, translate, summarize, reorder, modernize, or rewrite prose.
+If uncertain about any proposed correction, keep that part exactly as CURRENT_SENTENCE.
 
 SAFETY RULES:
-1. OLD must be a NON-EMPTY exact token copied from CURRENT.
-2. Prefer NEW visibly supported by OCR_ALTERNATIVES.
-3. A segment operation without a matching alternative is allowed only when removing spaces/diacritics makes OLD and NEW the same glyph sequence.
-4. Do not delete text, insert unrelated words, change word order, or rewrite a sentence.
-5. Maximum 3 operations per item.
-6. confidence is 0..1. Use high confidence only when the correction is clear.
+1. corrected_sentence must preserve all already-correct words, punctuation, capitalization, numbers, and word order.
+2. Changes are limited to OCR recognition repair: wrong letters/diacritics, or safe splitting of a fused OCR token.
+3. Do not add missing ideas, delete words, or replace a phrase merely because another wording sounds better.
+4. Prefer readings visibly supported by OCR_ALTERNATIVES. Use CONTEXT to choose between plausible OCR readings.
+5. confidence is confidence in the ENTIRE corrected sentence, not in one token. Use >=0.98 only when every change is clear.
+6. If no safe correction is needed, return corrected_sentence exactly equal to CURRENT_SENTENCE.
+
+Examples:
+CURRENT_SENTENCE: "Xác định thời gian bất đâu cho công việc."
+If context clearly means a starting time, return "Xác định thời gian bắt đầu cho công việc." as one sentence correction, not a partial "bắt đâu".
+
+CURRENT_SENTENCE: "Lạc Da đang cam cui làm việc."
+If the evidence/context supports it, correct the complete phrase together, e.g. "Lạc Đà đang cặm cụi làm việc." Do not stop halfway at "cặm cui".
 
 Return JSON ONLY in this exact shape:
-{"items":[{"id":"...","ops":[{"kind":"replace","old":"exact","new":"exact","confidence":0.99}]}]}
-For segmentation use kind="segment" and NEW may contain one or two spaces.
+{"items":[{"id":"...","corrected_sentence":"complete sentence","confidence":0.99}]}
 """
 
 
@@ -35,10 +39,11 @@ def build_prompt(items: list[DeepQueueItem]) -> str:
     payload = [
         {
             "id": item.item_id,
-            "current": item.current,
+            "current_sentence": item.current,
             "context": item.context,
             "ocr_alternatives": item.candidates,
             "flags": item.reasons,
+            "source_lines": item.source_ids,
         }
         for item in items
     ]
